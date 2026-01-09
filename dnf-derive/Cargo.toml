@@ -1,0 +1,29 @@
+[package]
+name = "dnf-derive"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version = "1.80"
+description = "Derive macro for dnf crate - generates DnfEvaluable trait implementations"
+repository = "https://github.com/Asuan/dnf"
+homepage = "https://github.com/Asuan/dnf"
+documentation = "https://docs.rs/dnf-derive"
+readme = "../README.md"
+keywords = ["dnf", "query", "derive"]
+categories = ["development-tools::procedural-macro-helpers"]
+exclude = ["/.github", ".gitignore", "target/"]
+
+[package.metadata.docs.rs]
+targets = []
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2.0", features = ["full"] }
+quote = "1.0"
+proc-macro2 = "1.0"
+
+[dev-dependencies]
+dnf = { path = "../dnf" }

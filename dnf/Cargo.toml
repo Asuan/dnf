@@ -1,0 +1,73 @@
+[package]
+name = "dnf"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version = "1.80"
+description = "Build and evaluate DNF (Disjunctive Normal Form) queries with a fluent API"
+repository = "https://github.com/Asuan/dnf"
+homepage = "https://github.com/Asuan/dnf"
+documentation = "https://docs.rs/dnf"
+readme = "../README.md"
+keywords = ["dnf", "query", "filter", "dsl", "expression"]
+categories = ["data-structures", "parser-implementations"]
+exclude = ["/.github", ".gitignore", "target/"]
+
+[package.metadata.docs.rs]
+all-features = true
+targets = []
+
+[dependencies]
+dnf-derive = { version = "0.1.0", path = "../dnf-derive", optional = true }
+serde = { version = "1.0", features = ["derive"], optional = true }
+
+[features]
+default = ["derive"]
+serde = ["dep:serde"]
+parser = []
+derive = ["dep:dnf-derive"]
+
+[[example]]
+name = "parser"
+path = "examples/parser.rs"
+required-features = ["parser", "derive"]
+
+[[example]]
+name = "derive"
+path = "examples/derive.rs"
+required-features = ["derive"]
+
+[[example]]
+name = "custom"
+path = "examples/custom_derive.rs"
+required-features = ["derive"]
+
+[[example]]
+name = "collections"
+path = "examples/collections.rs"
+required-features = ["derive"]
+
+[[example]]
+name = "custom_operators"
+path = "examples/custom_operators.rs"
+required-features = ["derive"]
+
+[[example]]
+name = "hashmap"
+path = "examples/hashmap.rs"
+required-features = ["derive"]
+
+[[example]]
+name = "serialization"
+path = "examples/serialization.rs"
+required-features = ["serde", "parser", "derive"]
+
+[dev-dependencies]
+criterion = { version = "0.8", features = ["html_reports"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[[bench]]
+name = "query_benchmarks"
+harness = false
