@@ -117,11 +117,12 @@ fn main() {
 
     // Field introspection
     for field in Document::fields() {
-        let kind = match field.kind {
+        let kind = match field.kind() {
             FieldKind::Scalar => "Scalar",
             FieldKind::Iter => "Iter",
             FieldKind::Map => "Map",
+            _ => "Other",
         };
-        println!("{}: {} ({})", field.name, field.field_type, kind);
+        println!("{}: {} ({})", field.name(), field.field_type(), kind);
     }
 }

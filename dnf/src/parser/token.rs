@@ -1,38 +1,37 @@
-use super::ParseError;
 use crate::error::DnfError;
 
 /// Tokens for the query language.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Token {
     // Identifiers and keywords
-    Identifier(String),
+    Identifier(Box<str>),
     And,
     Or,
 
     // Operators
-    Eq,               // == or =
-    Ne,               // !=
-    Gt,               // >
-    Lt,               // <
-    Gte,              // >=
-    Lte,              // <=
-    Contains,         // CONTAINS
-    NotContains,      // NOT CONTAINS
-    StartsWith,       // STARTS WITH
-    EndsWith,         // ENDS WITH
-    NotStartsWith,    // NOT STARTS WITH
-    NotEndsWith,      // NOT ENDS WITH
-    AllOf,            // ALL OF
-    AnyOf,            // IN (value in array)
-    NotAllOf,         // NOT ALL OF
-    NotAnyOf,         // NOT IN (value not in array)
-    Between,          // BETWEEN [min, max]
-    NotBetween,       // NOT BETWEEN [min, max]
-    CustomOp(String), // Custom operator (e.g., IS_ADULT)
+    Eq,                 // == or =
+    Ne,                 // !=
+    Gt,                 // >
+    Lt,                 // <
+    Gte,                // >=
+    Lte,                // <=
+    Contains,           // CONTAINS
+    NotContains,        // NOT CONTAINS
+    StartsWith,         // STARTS WITH
+    EndsWith,           // ENDS WITH
+    NotStartsWith,      // NOT STARTS WITH
+    NotEndsWith,        // NOT ENDS WITH
+    AllOf,              // ALL OF
+    AnyOf,              // IN (value in array)
+    NotAllOf,           // NOT ALL OF
+    NotAnyOf,           // NOT IN (value not in array)
+    Between,            // BETWEEN [min, max]
+    NotBetween,         // NOT BETWEEN [min, max]
+    CustomOp(Box<str>), // Custom operator (e.g., IS_ADULT)
 
     // Values
-    String(String),
-    Number(String),
+    String(Box<str>),
+    Number(Box<str>),
     Boolean(bool),
     Null,
 
@@ -46,6 +45,9 @@ pub(crate) enum Token {
     // Map target tokens
     MapKeys,   // .@keys
     MapValues, // .@values
+
+    // Internal sentinel; not produced by the tokenizer.
+    Consumed,
 }
 
 impl std::fmt::Display for Token {
@@ -84,6 +86,7 @@ impl std::fmt::Display for Token {
             Token::Comma => write!(f, ","),
             Token::MapKeys => write!(f, ".@keys"),
             Token::MapValues => write!(f, ".@values"),
+            Token::Consumed => write!(f, "<consumed>"),
         }
     }
 }
@@ -128,12 +131,12 @@ pub(crate) fn tokenize(
                     chars.next();
                     tokens.push(Token::Ne);
                 } else {
-                    return Err(DnfError::ParseError(ParseError::UnexpectedToken {
+                    return Err(DnfError::UnexpectedToken {
                         expected: "!=".to_string(),
                         found: "!".to_string(),
                         position: pos,
                         input: input_string.clone(),
-                    }));
+                    });
                 }
             }
             '>' => {
@@ -173,21 +176,21 @@ pub(crate) fn tokenize(
                         "keys" => tokens.push(Token::MapKeys),
                         "values" => tokens.push(Token::MapValues),
                         _ => {
-                            return Err(DnfError::ParseError(ParseError::UnexpectedToken {
+                            return Err(DnfError::UnexpectedToken {
                                 expected: "@keys or @values".to_string(),
                                 found: format!("@{}", target),
                                 position: pos,
                                 input: input_string.clone(),
-                            }));
+                            });
                         }
                     }
                 } else {
-                    return Err(DnfError::ParseError(ParseError::UnexpectedToken {
+                    return Err(DnfError::UnexpectedToken {
                         expected: "identifier or @".to_string(),
                         found: ".".to_string(),
                         position: pos,
                         input: input_string.clone(),
-                    }));
+                    });
                 }
             }
 
@@ -209,18 +212,18 @@ pub(crate) fn tokenize(
                             '\'' => string.push('\''),
                             '/' => string.push('/'),
                             _ => {
-                                return Err(DnfError::ParseError(ParseError::InvalidEscape {
+                                return Err(DnfError::InvalidEscape {
                                     escape: format!("\\{}", ch),
                                     position: escape_pos,
                                     input: input_string.clone(),
-                                }));
+                                });
                             }
                         }
                         escaped = false;
                     } else if ch == '\\' {
                         escaped = true;
                     } else if ch == quote {
-                        tokens.push(Token::String(string));
+                        tokens.push(Token::String(string.into_boxed_str()));
                         found_closing_quote = true;
                         break;
                     } else {
@@ -230,10 +233,10 @@ pub(crate) fn tokenize(
 
                 // Check if we found the closing quote
                 if !found_closing_quote {
-                    return Err(DnfError::ParseError(ParseError::UnterminatedString {
+                    return Err(DnfError::UnterminatedString {
                         position: pos,
                         input: input_string.clone(),
-                    }));
+                    });
                 }
             }
 
@@ -251,11 +254,11 @@ pub(crate) fn tokenize(
                         .map(|(_, c)| c.is_ascii_digit())
                         .unwrap_or(false)
                     {
-                        return Err(DnfError::ParseError(ParseError::InvalidNumber {
+                        return Err(DnfError::InvalidNumber {
                             value: number,
                             position: pos,
                             input: input_string.clone(),
-                        }));
+                        });
                     }
                 }
 
@@ -268,7 +271,7 @@ pub(crate) fn tokenize(
                     }
                 }
 
-                tokens.push(Token::Number(number));
+                tokens.push(Token::Number(number.into_boxed_str()));
             }
 
             // Identifiers and keywords (supports nested fields like user.name.first)
@@ -335,14 +338,14 @@ pub(crate) fn tokenize(
                         }
 
                         if next_word.is_empty() {
-                            return Err(DnfError::ParseError(ParseError::UnexpectedToken {
+                            return Err(DnfError::UnexpectedToken {
                                 expected:
                                     "CONTAINS, IN, BETWEEN, STARTS, ENDS, ALL, or ANY (after NOT)"
                                         .to_string(),
                                 found: "end of expression".to_string(),
                                 position: next_word_pos,
                                 input: input_string.clone(),
-                            }));
+                            });
                         }
 
                         match next_word.as_str() {
@@ -371,14 +374,12 @@ pub(crate) fn tokenize(
                                 if with_word == "WITH" {
                                     tokens.push(Token::NotStartsWith);
                                 } else {
-                                    return Err(DnfError::ParseError(
-                                        ParseError::UnexpectedToken {
-                                            expected: "WITH (after NOT STARTS)".to_string(),
-                                            found: with_word,
-                                            position: with_pos,
-                                            input: input_string.clone(),
-                                        },
-                                    ));
+                                    return Err(DnfError::UnexpectedToken {
+                                        expected: "WITH (after NOT STARTS)".to_string(),
+                                        found: with_word,
+                                        position: with_pos,
+                                        input: input_string.clone(),
+                                    });
                                 }
                             }
                             "ENDS" => {
@@ -403,14 +404,12 @@ pub(crate) fn tokenize(
                                 if with_word == "WITH" {
                                     tokens.push(Token::NotEndsWith);
                                 } else {
-                                    return Err(DnfError::ParseError(
-                                        ParseError::UnexpectedToken {
-                                            expected: "WITH (after NOT ENDS)".to_string(),
-                                            found: with_word,
-                                            position: with_pos,
-                                            input: input_string.clone(),
-                                        },
-                                    ));
+                                    return Err(DnfError::UnexpectedToken {
+                                        expected: "WITH (after NOT ENDS)".to_string(),
+                                        found: with_word,
+                                        position: with_pos,
+                                        input: input_string.clone(),
+                                    });
                                 }
                             }
                             "ALL" => {
@@ -435,26 +434,24 @@ pub(crate) fn tokenize(
                                 if of_word == "OF" {
                                     tokens.push(Token::NotAllOf);
                                 } else {
-                                    return Err(DnfError::ParseError(
-                                        ParseError::UnexpectedToken {
-                                            expected: "OF (after NOT ALL)".to_string(),
-                                            found: of_word,
-                                            position: of_pos,
-                                            input: input_string.clone(),
-                                        },
-                                    ));
+                                    return Err(DnfError::UnexpectedToken {
+                                        expected: "OF (after NOT ALL)".to_string(),
+                                        found: of_word,
+                                        position: of_pos,
+                                        input: input_string.clone(),
+                                    });
                                 }
                             }
                             // "NOT ANY" is not supported - use "NOT IN" instead
                             _ => {
-                                return Err(DnfError::ParseError(ParseError::UnexpectedToken {
+                                return Err(DnfError::UnexpectedToken {
                                     expected:
                                         "CONTAINS, IN, BETWEEN, STARTS, ENDS, or ALL (after NOT)"
                                             .to_string(),
                                     found: next_word,
                                     position: next_word_pos,
                                     input: input_string.clone(),
-                                }));
+                                });
                             }
                         }
                     }
@@ -484,23 +481,23 @@ pub(crate) fn tokenize(
                         }
 
                         if next_word.is_empty() {
-                            return Err(DnfError::ParseError(ParseError::UnexpectedToken {
+                            return Err(DnfError::UnexpectedToken {
                                 expected: "WITH (after STARTS)".to_string(),
                                 found: "end of expression".to_string(),
                                 position: next_word_pos,
                                 input: input_string.clone(),
-                            }));
+                            });
                         }
 
                         if next_word == "WITH" {
                             tokens.push(Token::StartsWith);
                         } else {
-                            return Err(DnfError::ParseError(ParseError::UnexpectedToken {
+                            return Err(DnfError::UnexpectedToken {
                                 expected: "WITH (after STARTS)".to_string(),
                                 found: next_word,
                                 position: next_word_pos,
                                 input: input_string.clone(),
-                            }));
+                            });
                         }
                     }
                     "ENDS" => {
@@ -529,23 +526,23 @@ pub(crate) fn tokenize(
                         }
 
                         if next_word.is_empty() {
-                            return Err(DnfError::ParseError(ParseError::UnexpectedToken {
+                            return Err(DnfError::UnexpectedToken {
                                 expected: "WITH (after ENDS)".to_string(),
                                 found: "end of expression".to_string(),
                                 position: next_word_pos,
                                 input: input_string.clone(),
-                            }));
+                            });
                         }
 
                         if next_word == "WITH" {
                             tokens.push(Token::EndsWith);
                         } else {
-                            return Err(DnfError::ParseError(ParseError::UnexpectedToken {
+                            return Err(DnfError::UnexpectedToken {
                                 expected: "WITH (after ENDS)".to_string(),
                                 found: next_word,
                                 position: next_word_pos,
                                 input: input_string.clone(),
-                            }));
+                            });
                         }
                     }
                     "ALL" => {
@@ -574,23 +571,23 @@ pub(crate) fn tokenize(
                         }
 
                         if next_word.is_empty() {
-                            return Err(DnfError::ParseError(ParseError::UnexpectedToken {
+                            return Err(DnfError::UnexpectedToken {
                                 expected: "OF (after ALL)".to_string(),
                                 found: "end of expression".to_string(),
                                 position: next_word_pos,
                                 input: input_string.clone(),
-                            }));
+                            });
                         }
 
-                        if next_word.to_uppercase() == "OF" {
+                        if next_word == "OF" {
                             tokens.push(Token::AllOf);
                         } else {
-                            return Err(DnfError::ParseError(ParseError::UnexpectedToken {
+                            return Err(DnfError::UnexpectedToken {
                                 expected: "OF (after ALL)".to_string(),
                                 found: next_word,
                                 position: next_word_pos,
                                 input: input_string.clone(),
-                            }));
+                            });
                         }
                     }
                     // "ANY" is not supported - use "IN" instead
@@ -600,24 +597,24 @@ pub(crate) fn tokenize(
                         if let Some(custom_ops) = custom_op_names {
                             // Case-sensitive match for custom operators
                             if custom_ops.iter().any(|op| op == &ident) {
-                                tokens.push(Token::CustomOp(ident));
+                                tokens.push(Token::CustomOp(ident.into_boxed_str()));
                             } else {
-                                tokens.push(Token::Identifier(ident));
+                                tokens.push(Token::Identifier(ident.into_boxed_str()));
                             }
                         } else {
-                            tokens.push(Token::Identifier(ident));
+                            tokens.push(Token::Identifier(ident.into_boxed_str()));
                         }
                     }
                 }
             }
 
             _ => {
-                return Err(DnfError::ParseError(ParseError::UnexpectedToken {
+                return Err(DnfError::UnexpectedToken {
                     expected: "valid token".to_string(),
                     found: ch.to_string(),
                     position: pos,
                     input: input_string.clone(),
-                }));
+                });
             }
         }
     }
@@ -644,47 +641,47 @@ mod tests {
                 name: "simple comparison",
                 input: "age > 18",
                 expected: vec![
-                    Token::Identifier("age".to_string()),
+                    Token::Identifier("age".into()),
                     Token::Gt,
-                    Token::Number("18".to_string()),
+                    Token::Number("18".into()),
                 ],
             },
             TokenizeTestCase {
                 name: "AND conjunction",
                 input: "age > 18 AND country == \"US\"",
                 expected: vec![
-                    Token::Identifier("age".to_string()),
+                    Token::Identifier("age".into()),
                     Token::Gt,
-                    Token::Number("18".to_string()),
+                    Token::Number("18".into()),
                     Token::And,
-                    Token::Identifier("country".to_string()),
+                    Token::Identifier("country".into()),
                     Token::Eq,
-                    Token::String("US".to_string()),
+                    Token::String("US".into()),
                 ],
             },
             TokenizeTestCase {
                 name: "string with spaces",
                 input: r#"name == "John Doe""#,
                 expected: vec![
-                    Token::Identifier("name".to_string()),
+                    Token::Identifier("name".into()),
                     Token::Eq,
-                    Token::String("John Doe".to_string()),
+                    Token::String("John Doe".into()),
                 ],
             },
             TokenizeTestCase {
                 name: "escaped quotes",
                 input: r#"name == "John \"The Boss\" Doe""#,
                 expected: vec![
-                    Token::Identifier("name".to_string()),
+                    Token::Identifier("name".into()),
                     Token::Eq,
-                    Token::String("John \"The Boss\" Doe".to_string()),
+                    Token::String("John \"The Boss\" Doe".into()),
                 ],
             },
             TokenizeTestCase {
                 name: "boolean value",
                 input: "premium == true",
                 expected: vec![
-                    Token::Identifier("premium".to_string()),
+                    Token::Identifier("premium".into()),
                     Token::Eq,
                     Token::Boolean(true),
                 ],
@@ -694,9 +691,9 @@ mod tests {
                 input: "(age > 18)",
                 expected: vec![
                     Token::LeftParen,
-                    Token::Identifier("age".to_string()),
+                    Token::Identifier("age".into()),
                     Token::Gt,
-                    Token::Number("18".to_string()),
+                    Token::Number("18".into()),
                     Token::RightParen,
                 ],
             },
@@ -704,27 +701,27 @@ mod tests {
                 name: "negative number",
                 input: "age > -5",
                 expected: vec![
-                    Token::Identifier("age".to_string()),
+                    Token::Identifier("age".into()),
                     Token::Gt,
-                    Token::Number("-5".to_string()),
+                    Token::Number("-5".into()),
                 ],
             },
             TokenizeTestCase {
                 name: "float number",
                 input: "price > 19.99",
                 expected: vec![
-                    Token::Identifier("price".to_string()),
+                    Token::Identifier("price".into()),
                     Token::Gt,
-                    Token::Number("19.99".to_string()),
+                    Token::Number("19.99".into()),
                 ],
             },
             TokenizeTestCase {
                 name: "multiword string value",
                 input: r#"description == "This is a multi word value""#,
                 expected: vec![
-                    Token::Identifier("description".to_string()),
+                    Token::Identifier("description".into()),
                     Token::Eq,
-                    Token::String("This is a multi word value".to_string()),
+                    Token::String("This is a multi word value".into()),
                 ],
             },
         ];
@@ -804,7 +801,7 @@ mod tests {
         let tokens = tokenize("age > 18 and premium == true", None).unwrap();
         assert_eq!(
             tokens[3],
-            Token::Identifier("and".to_string()),
+            Token::Identifier("and".into()),
             "lowercase 'and' should be identifier"
         );
         assert_eq!(tokens[6], Token::Boolean(true), "true should still work");
@@ -814,7 +811,7 @@ mod tests {
         assert_eq!(tokens[3], Token::And, "AND should be recognized");
         assert_eq!(
             tokens[6],
-            Token::Identifier("TRUE".to_string()),
+            Token::Identifier("TRUE".into()),
             "uppercase 'TRUE' should be identifier"
         );
 
@@ -822,7 +819,7 @@ mod tests {
         let tokens = tokenize("age > 18 AnD premium == true", None).unwrap();
         assert_eq!(
             tokens[3],
-            Token::Identifier("AnD".to_string()),
+            Token::Identifier("AnD".into()),
             "mixed case 'AnD' should be identifier"
         );
     }
@@ -834,12 +831,12 @@ mod tests {
                 name: "string array",
                 input: r#"status IN ["active", "pending"]"#,
                 expected: vec![
-                    Token::Identifier("status".to_string()),
+                    Token::Identifier("status".into()),
                     Token::AnyOf,
                     Token::LeftBracket,
-                    Token::String("active".to_string()),
+                    Token::String("active".into()),
                     Token::Comma,
-                    Token::String("pending".to_string()),
+                    Token::String("pending".into()),
                     Token::RightBracket,
                 ],
             },
@@ -847,14 +844,14 @@ mod tests {
                 name: "numeric array",
                 input: "age IN [18, 21, 25]",
                 expected: vec![
-                    Token::Identifier("age".to_string()),
+                    Token::Identifier("age".into()),
                     Token::AnyOf,
                     Token::LeftBracket,
-                    Token::Number("18".to_string()),
+                    Token::Number("18".into()),
                     Token::Comma,
-                    Token::Number("21".to_string()),
+                    Token::Number("21".into()),
                     Token::Comma,
-                    Token::Number("25".to_string()),
+                    Token::Number("25".into()),
                     Token::RightBracket,
                 ],
             },
@@ -862,10 +859,10 @@ mod tests {
                 name: "NOT IN operator",
                 input: r#"status NOT IN ["deleted"]"#,
                 expected: vec![
-                    Token::Identifier("status".to_string()),
+                    Token::Identifier("status".into()),
                     Token::NotAnyOf,
                     Token::LeftBracket,
-                    Token::String("deleted".to_string()),
+                    Token::String("deleted".into()),
                     Token::RightBracket,
                 ],
             },
@@ -873,9 +870,9 @@ mod tests {
                 name: "IN without array",
                 input: "status IN values",
                 expected: vec![
-                    Token::Identifier("status".to_string()),
+                    Token::Identifier("status".into()),
                     Token::AnyOf,
-                    Token::Identifier("values".to_string()),
+                    Token::Identifier("values".into()),
                 ],
             },
         ];
@@ -897,22 +894,22 @@ mod tests {
                 name: "simple nested field",
                 input: r#"user.name.first == "John""#,
                 expected: vec![
-                    Token::Identifier("user.name.first".to_string()),
+                    Token::Identifier("user.name.first".into()),
                     Token::Eq,
-                    Token::String("John".to_string()),
+                    Token::String("John".into()),
                 ],
             },
             TokenizeTestCase {
                 name: "nested fields with operators",
                 input: "person.age > 18 AND person.contact.email CONTAINS \"@\"",
                 expected: vec![
-                    Token::Identifier("person.age".to_string()),
+                    Token::Identifier("person.age".into()),
                     Token::Gt,
-                    Token::Number("18".to_string()),
+                    Token::Number("18".into()),
                     Token::And,
-                    Token::Identifier("person.contact.email".to_string()),
+                    Token::Identifier("person.contact.email".into()),
                     Token::Contains,
-                    Token::String("@".to_string()),
+                    Token::String("@".into()),
                 ],
             },
         ];
@@ -956,45 +953,45 @@ mod tests {
                 name: "escaped backslash",
                 input: r#"path == "C:\\Users\\John""#,
                 expected: vec![
-                    Token::Identifier("path".to_string()),
+                    Token::Identifier("path".into()),
                     Token::Eq,
-                    Token::String("C:\\Users\\John".to_string()),
+                    Token::String("C:\\Users\\John".into()),
                 ],
             },
             TokenizeTestCase {
                 name: "escaped forward slash",
                 input: r#"url == "https:\/\/example.com""#,
                 expected: vec![
-                    Token::Identifier("url".to_string()),
+                    Token::Identifier("url".into()),
                     Token::Eq,
-                    Token::String("https://example.com".to_string()),
+                    Token::String("https://example.com".into()),
                 ],
             },
             TokenizeTestCase {
                 name: "escaped quotes in string",
                 input: r#"quote == "He said \"Hello\"""#,
                 expected: vec![
-                    Token::Identifier("quote".to_string()),
+                    Token::Identifier("quote".into()),
                     Token::Eq,
-                    Token::String(r#"He said "Hello""#.to_string()),
+                    Token::String(r#"He said "Hello""#.into()),
                 ],
             },
             TokenizeTestCase {
                 name: "newline and tab",
                 input: "text == \"Line1\\nLine2\\tTabbed\"",
                 expected: vec![
-                    Token::Identifier("text".to_string()),
+                    Token::Identifier("text".into()),
                     Token::Eq,
-                    Token::String("Line1\nLine2\tTabbed".to_string()),
+                    Token::String("Line1\nLine2\tTabbed".into()),
                 ],
             },
             TokenizeTestCase {
                 name: "mixed escapes",
                 input: r#"data == "Path: C:\\test\nURL: https:\/\/site.com""#,
                 expected: vec![
-                    Token::Identifier("data".to_string()),
+                    Token::Identifier("data".into()),
                     Token::Eq,
-                    Token::String("Path: C:\\test\nURL: https://site.com".to_string()),
+                    Token::String("Path: C:\\test\nURL: https://site.com".into()),
                 ],
             },
         ];
@@ -1025,10 +1022,7 @@ mod tests {
         for (name, input) in cases {
             let result = tokenize(input, None);
             assert!(
-                matches!(
-                    result,
-                    Err(DnfError::ParseError(ParseError::UnterminatedString { .. }))
-                ),
+                matches!(result, Err(DnfError::UnterminatedString { .. })),
                 "Expected UnterminatedString for '{}': {}",
                 name,
                 input
@@ -1079,17 +1073,13 @@ mod tests {
         for case in cases {
             let result = tokenize(case.input, None);
             assert!(
-                matches!(
-                    result,
-                    Err(DnfError::ParseError(ParseError::UnexpectedToken { .. }))
-                ),
+                matches!(result, Err(DnfError::UnexpectedToken { .. })),
                 "Expected UnexpectedToken for '{}': {}",
                 case.name,
                 case.input
             );
 
-            if let Err(DnfError::ParseError(ParseError::UnexpectedToken { expected, .. })) = result
-            {
+            if let Err(DnfError::UnexpectedToken { expected, .. }) = result {
                 assert!(
                     expected.contains(case.expected_contains),
                     "Error for '{}' should contain '{}', got: {}",

@@ -2,43 +2,61 @@ use proc_macro::TokenStream;
 use quote::quote;
 use syn::{parse_macro_input, Data, DeriveInput, Field, Fields};
 
-/// Derive macro for `DnfEvaluable` trait.
+/// Derives `DnfEvaluable` for a struct with named fields.
 ///
-/// # Supported Types
+/// The macro generates a `DnfEvaluable` implementation that dispatches on
+/// the field name, delegating to the `DnfField` impl of each field's type.
+/// It supports nested access via dot notation, map targets via `@keys` /
+/// `@values`, and per-field configuration via `#[dnf(...)]` attributes.
 ///
-/// - Primitives: `i8`-`i64`, `u8`-`u64`, `f32`, `f64`, `bool`, `String`, `Cow<str>`
-/// - Collections: `Vec<T>`, `HashSet<T>` (T: primitive)
-/// - Maps: `HashMap<String, V>`, `BTreeMap<String, V>` (V: primitive)
-/// - Options: `Option<T>` (T: any supported)
-/// - Custom: any type implementing `DnfField`
+/// # Supported field types
 ///
-/// # Custom Types
-///
-/// Implement `DnfField` to use custom types with derive:
-///
-/// ```rust,ignore
-/// impl DnfField for Score {
-///     fn evaluate(&self, op: &Op, value: &Value) -> bool {
-///         (self.0 as i64).evaluate(op, value)
-///     }
-/// }
-/// ```
+/// - Primitives: `i8`–`i64`, `u8`–`u64`, `f32`, `f64`, `bool`, `String`,
+///   `Cow<str>`.
+/// - Collections: `Vec<T>`, `HashSet<T>` where `T` is a primitive.
+/// - Maps: `HashMap<String, V>`, `BTreeMap<String, V>` where `V` is a
+///   primitive or another `DnfEvaluable` struct.
+/// - Options: `Option<T>` where `T` is any supported type.
+/// - User types implementing `DnfField` (or `DnfEvaluable` for nested
+///   structs).
 ///
 /// For computed fields, implement `DnfEvaluable` manually instead.
 ///
 /// # Attributes
 ///
-/// - `#[dnf(skip)]` - exclude field
-/// - `#[dnf(rename = "name")]` - custom query name
-/// - `#[dnf(nested)]` - force nested access (auto-detected for non-primitives)
-/// - `#[dnf(iter)]` or `#[dnf(iter = "method")]` - custom collection iterator
+/// - `#[dnf(skip)]` — exclude the field from queries.
+/// - `#[dnf(rename = "name")]` — expose the field under a different name in queries.
+/// - `#[dnf(nested)]` — force nested-access dispatch (auto-detected for non-primitive types).
+/// - `#[dnf(iter)]` or `#[dnf(iter = "method")]` — use a custom iterator on
+///   the field for collection-style queries.
 ///
-/// # Nested Access
+/// # Nested access
 ///
-/// Non-primitive types auto-detected. Query with dot notation: `address.city == "Boston"`
+/// Non-primitive fields are queried with dot notation, e.g.
+/// `address.city == "Boston"`.
 ///
-/// - `Vec<T>`: `items.field` - any item matches
-/// - `HashMap<K,V>`: `map.@values.field`, `map.@keys`, `map.["key"].field`
+/// - `Vec<T>`: `items.field` matches if any item satisfies the predicate.
+/// - `HashMap<K, V>`: `map.@keys`, `map.@values.field`,
+///   `map.["key"].field`.
+///
+/// # Examples
+///
+/// ```ignore
+/// use dnf::{DnfEvaluable, DnfQuery, Op};
+///
+/// #[derive(DnfEvaluable)]
+/// struct User {
+///     age: u32,
+///     name: String,
+/// }
+///
+/// let query = DnfQuery::builder()
+///     .or(|c| c.and("age", Op::GT, 18).and("name", Op::CONTAINS, "Al"))
+///     .build();
+///
+/// let alice = User { age: 25, name: "Alice".into() };
+/// assert!(query.evaluate(&alice));
+/// ```
 #[proc_macro_derive(DnfEvaluable, attributes(dnf))]
 pub fn derive_dnf_evaluable(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -74,8 +92,11 @@ pub fn derive_dnf_evaluable(input: TokenStream) -> TokenStream {
     // Generate field info list
     let field_infos = fields.iter().filter_map(generate_field_info);
 
-    // Generate get_field_value match arms for custom operator support
+    // Generate field_value match arms for custom operator support
     let field_value_arms = fields.iter().filter_map(generate_field_value_arm);
+
+    // Generate validate_field_path arms that recurse into scalar nested structs
+    let validate_path_arms = fields.iter().filter_map(generate_validate_field_path_arm);
 
     let expanded = quote! {
         impl dnf::DnfEvaluable for #name {
@@ -104,7 +125,7 @@ pub fn derive_dnf_evaluable(input: TokenStream) -> TokenStream {
                 }
             }
 
-            fn get_field_value(&self, field_name: &str) -> Option<dnf::Value> {
+            fn field_value(&self, field_name: &str) -> Option<dnf::Value> {
                 match field_name {
                     #(#field_value_arms)*
                     _ => None,
@@ -115,6 +136,26 @@ pub fn derive_dnf_evaluable(input: TokenStream) -> TokenStream {
                 [
                     #(#field_infos),*
                 ].into_iter()
+            }
+
+            fn validate_field_path(path: &str) -> Option<dnf::FieldKind> {
+                if let Some(dot) = path.find('.') {
+                    let (head, tail) = path.split_at(dot);
+                    let tail = &tail[1..];
+                    match head {
+                        #(#validate_path_arms)*
+                        _ => {
+                            let _ = tail;
+                            <Self as dnf::DnfEvaluable>::fields()
+                                .find(|f| f.name() == head)
+                                .map(|f| f.kind())
+                        }
+                    }
+                } else {
+                    <Self as dnf::DnfEvaluable>::fields()
+                        .find(|f| f.name() == path)
+                        .map(|f| f.kind())
+                }
             }
         }
     };
@@ -154,7 +195,7 @@ fn generate_field_match_arm(field: &Field) -> Option<proc_macro2::TokenStream> {
     })
 }
 
-/// Generate a match arm for get_field_value (custom operator support).
+/// Generate a match arm for field_value (custom operator support).
 /// Converts the field to Value for custom operator evaluation.
 /// Only generates for types that have `From<&T>` implementation for Value.
 fn generate_field_value_arm(field: &Field) -> Option<proc_macro2::TokenStream> {
@@ -225,6 +266,11 @@ fn is_value_convertible(type_str: &str) -> bool {
 
     // Cow<str> variants (Cow<'_, str>, Cow<'static, str>, etc.)
     if type_str.starts_with("Cow<") && type_str.contains("str") {
+        return true;
+    }
+
+    // Box<str>
+    if type_str == "Box<str>" {
         return true;
     }
 
@@ -522,6 +568,54 @@ fn generate_nested_field_match_arm(field: &Field) -> Option<proc_macro2::TokenSt
     })
 }
 
+/// Emits a `validate_field_path` arm that recurses into a scalar nested
+/// struct so the full dotted path is validated. Only fires for non-collection
+/// nested types — collection/map nesting is left to the fallback arm, which
+/// returns the field's kind without descending further.
+fn generate_validate_field_path_arm(field: &Field) -> Option<proc_macro2::TokenStream> {
+    let field_name = field.ident.as_ref()?;
+    let field_type = &field.ty;
+
+    if has_skip_attribute(field) {
+        return None;
+    }
+
+    let type_str = quote!(#field_type).to_string().replace(" ", "");
+
+    // Only recurse for explicit scalar nested fields. Collection/map nested
+    // types use runtime-interpreted syntax (@values, ["key"], etc.) and are
+    // handled by the fallback arm.
+    if !has_nested_attribute(field) {
+        return None;
+    }
+    let is_collection = type_str.starts_with("Vec<")
+        || type_str.starts_with("Option<Vec<")
+        || type_str.starts_with("HashMap<")
+        || type_str.starts_with("BTreeMap<")
+        || type_str.starts_with("Option<HashMap<")
+        || type_str.starts_with("Option<BTreeMap<")
+        || type_str.starts_with("HashSet<")
+        || type_str.starts_with("BTreeSet<");
+    if is_collection {
+        return None;
+    }
+
+    let query_name = get_rename_attribute(field).unwrap_or_else(|| field_name.to_string());
+
+    // Strip Option<T> for the recurse target so Option<Address> recurses
+    // through Address::validate_field_path.
+    let inner_type_str = type_str
+        .strip_prefix("Option<")
+        .and_then(|s| s.strip_suffix(">"))
+        .unwrap_or(&type_str)
+        .to_string();
+    let inner_type: syn::Type = syn::parse_str(&inner_type_str).ok()?;
+
+    Some(quote! {
+        #query_name => <#inner_type as dnf::DnfEvaluable>::validate_field_path(tail),
+    })
+}
+
 /// Get rename attribute value if present
 fn get_rename_attribute(field: &Field) -> Option<String> {
     for attr in &field.attrs {
@@ -629,6 +723,11 @@ fn is_primitive_or_builtin(type_str: &str) -> bool {
         return true;
     }
 
+    // Box<str>
+    if type_str == "Box<str>" {
+        return true;
+    }
+
     // Vec<T> variants - check if inner type is supported
     if type_str.starts_with("Vec<") {
         if let Some(inner) = type_str.strip_prefix("Vec<") {
@@ -706,11 +805,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_primitives_use_dnf_field() {
-        // All types now use DnfField::evaluate() for consistency
-        let primitives = vec!["String", "u32", "i64", "f64", "bool"];
+    fn test_all_field_types_use_dnf_field() {
+        // Every supported field-type category should expand to a
+        // `DnfField::evaluate(...)` call: primitives, collections, and
+        // user-defined scalar types alike.
+        let types = [
+            // primitives
+            "String",
+            "u32",
+            "i64",
+            "f64",
+            "bool",
+            // collections
+            "Vec<String>",
+            "HashSet<i32>",
+            // user-defined scalar types
+            "Score",
+            "CustomEnum",
+            "MyStruct",
+        ];
 
-        for type_str in primitives {
+        for type_str in types {
             let input_str = format!("struct User {{ field: {} }}", type_str);
             let input: proc_macro2::TokenStream = input_str.parse().unwrap();
 
@@ -728,78 +843,9 @@ mod tests {
                     generate_value_conversion(field, field.ident.as_ref().unwrap(), &field.ty);
                 let conversion_str = conversion.to_string();
 
-                // All types use DnfField::evaluate()
                 assert!(
                     conversion_str.contains("DnfField :: evaluate"),
                     "Type {} should use DnfField::evaluate(), got: {}",
-                    type_str,
-                    conversion_str
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_collections_use_dnf_field() {
-        // Collections also use DnfField::evaluate() (dispatches to Op::any internally)
-        let collections = vec!["Vec<String>", "HashSet<i32>"];
-
-        for type_str in collections {
-            let input_str = format!("struct User {{ field: {} }}", type_str);
-            let input: proc_macro2::TokenStream = input_str.parse().unwrap();
-
-            let parsed: DeriveInput = syn::parse2(input).unwrap();
-            let fields = match &parsed.data {
-                Data::Struct(data) => match &data.fields {
-                    Fields::Named(fields) => &fields.named,
-                    _ => continue,
-                },
-                _ => continue,
-            };
-
-            if let Some(field) = fields.first() {
-                let conversion =
-                    generate_value_conversion(field, field.ident.as_ref().unwrap(), &field.ty);
-                let conversion_str = conversion.to_string();
-
-                // Collections use DnfField::evaluate()
-                assert!(
-                    conversion_str.contains("DnfField :: evaluate"),
-                    "Collection {} should use DnfField::evaluate(), got: {}",
-                    type_str,
-                    conversion_str
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_custom_types_use_dnf_field() {
-        // Custom types should use DnfField::evaluate()
-        let custom_types = vec!["Score", "CustomEnum", "MyStruct"];
-
-        for type_str in custom_types {
-            let input_str = format!("struct User {{ field: {} }}", type_str);
-            let input: proc_macro2::TokenStream = input_str.parse().unwrap();
-
-            let parsed: DeriveInput = syn::parse2(input).unwrap();
-            let fields = match &parsed.data {
-                Data::Struct(data) => match &data.fields {
-                    Fields::Named(fields) => &fields.named,
-                    _ => continue,
-                },
-                _ => continue,
-            };
-
-            if let Some(field) = fields.first() {
-                let conversion =
-                    generate_value_conversion(field, field.ident.as_ref().unwrap(), &field.ty);
-                let conversion_str = conversion.to_string();
-
-                // Custom types should use DnfField::evaluate()
-                assert!(
-                    conversion_str.contains("DnfField :: evaluate"),
-                    "Custom type {} should use DnfField::evaluate(), got: {}",
                     type_str,
                     conversion_str
                 );

@@ -268,11 +268,11 @@ fn test_hashmap_values_numeric() {
 fn test_hashmap_field_kind() {
     let fields: Vec<_> = Document::fields().collect();
 
-    let title_field = fields.iter().find(|f| f.name == "title").unwrap();
-    let metadata_field = fields.iter().find(|f| f.name == "metadata").unwrap();
+    let title_field = fields.iter().find(|f| f.name() == "title").unwrap();
+    let metadata_field = fields.iter().find(|f| f.name() == "metadata").unwrap();
 
-    assert_eq!(title_field.kind, FieldKind::Scalar);
-    assert_eq!(metadata_field.kind, FieldKind::Map);
+    assert_eq!(title_field.kind(), FieldKind::Scalar);
+    assert_eq!(metadata_field.kind(), FieldKind::Map);
 }
 
 // ==================== Tests: Empty Maps ====================
@@ -646,7 +646,11 @@ fn test_validate_field_names() {
         ("address.zip", true, "valid nested field zip"),
         ("unknown", false, "unknown root field"),
         ("unknown.city", false, "unknown nested root"),
-        ("address.unknown", true, "unknown nested leaf (root valid)"),
+        (
+            "address.unknown",
+            false,
+            "unknown nested leaf is now caught",
+        ),
     ];
 
     for (field, expected_ok, desc) in test_cases {

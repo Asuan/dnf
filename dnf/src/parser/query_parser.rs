@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
 use super::token::Token;
-use super::ParseError;
 use crate::error::DnfError;
 use crate::{Condition, Conjunction, DnfQuery, FieldInfo, FieldKind, Op, Value};
 
@@ -35,7 +34,7 @@ impl<'a> Parser<'a> {
     ) -> Self {
         let field_map = fields
             .iter()
-            .map(|f| (f.name, (f.field_type, f.kind)))
+            .map(|f| (f.name(), (f.field_type(), f.kind())))
             .collect();
 
         let novalue_ops = novalue_ops
@@ -53,14 +52,6 @@ impl<'a> Parser<'a> {
 
     // Helper methods for error creation
 
-    fn invalid_number_error(&self, value: &Value) -> DnfError {
-        DnfError::ParseError(ParseError::InvalidNumber {
-            value: format!("{:?}", value),
-            position: self.current,
-            input: self.input.clone(),
-        })
-    }
-
     fn type_mismatch_error(
         &self,
         field: &str,
@@ -75,17 +66,24 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn unexpected_eof(&self) -> DnfError {
+        DnfError::UnexpectedEof {
+            position: self.input.len(),
+            input: self.input.clone(),
+        }
+    }
+
     /// Parse the tokens into a DnfQuery.
     pub(crate) fn parse(mut self) -> Result<DnfQuery, DnfError> {
         if self.tokens.is_empty() {
-            return Err(DnfError::ParseError(ParseError::EmptyQuery));
+            return Err(DnfError::EmptyQuery);
         }
 
         let conjunctions = self.parse_or_expr()?;
 
         // Ensure we consumed all tokens
         if !self.is_at_end() {
-            return Err(DnfError::ParseError(ParseError::UnexpectedToken {
+            return Err(DnfError::UnexpectedToken {
                 expected: "end of input".to_string(),
                 found: self
                     .peek()
@@ -93,7 +91,7 @@ impl<'a> Parser<'a> {
                     .unwrap_or_else(|| "EOF".to_string()),
                 position: self.current,
                 input: self.input.clone(),
-            }));
+            });
         }
 
         Ok(DnfQuery::from_conjunctions(conjunctions))
@@ -125,7 +123,7 @@ impl<'a> Parser<'a> {
 
         // If we had an opening paren, expect a closing one
         if has_parens && !self.match_token(&Token::RightParen) {
-            return Err(DnfError::ParseError(ParseError::UnexpectedToken {
+            return Err(DnfError::UnexpectedToken {
                 expected: ")".to_string(),
                 found: self
                     .peek()
@@ -133,7 +131,7 @@ impl<'a> Parser<'a> {
                     .unwrap_or_else(|| "EOF".to_string()),
                 position: self.current,
                 input: self.input.clone(),
-            }));
+            });
         }
 
         Ok(Conjunction::from_conditions(conditions))
@@ -142,26 +140,26 @@ impl<'a> Parser<'a> {
     /// Parse a single condition: identifier operator value
     /// Supports map field syntax: field["key"], field.@keys, field.@values
     fn parse_condition(&mut self) -> Result<Condition, DnfError> {
-        let field_name_str = match self.advance() {
-            Some(Token::Identifier(name)) => name.clone(),
+        let field_name_str: Box<str> = match self.advance() {
+            Some(Token::Identifier(name)) => name,
             Some(token) => {
-                return Err(DnfError::ParseError(ParseError::UnexpectedToken {
+                return Err(DnfError::UnexpectedToken {
                     expected: "field identifier".to_string(),
                     found: token.to_string(),
                     position: self.current - 1,
                     input: self.input.clone(),
-                }));
+                });
             }
-            None => return Err(DnfError::ParseError(ParseError::UnexpectedEof)),
+            None => return Err(self.unexpected_eof()),
         };
 
         let (field_type, field_kind) =
             *self
                 .fields
-                .get(field_name_str.as_str())
+                .get(field_name_str.as_ref())
                 .ok_or_else(|| DnfError::UnknownField {
-                    field_name: field_name_str.clone().into_boxed_str(),
-                    position: self.current - 1,
+                    field_name: field_name_str.clone(),
+                    position: Some(self.current - 1),
                 })?;
 
         // Check for map target syntax: .@keys, .@values, or ["key"]
@@ -222,7 +220,7 @@ impl<'a> Parser<'a> {
         let value = match map_target {
             Some(MapTarget::AtKey) => {
                 let key = at_key_value.expect("AtKey should have key");
-                Value::AtKey(Box::from(key.as_str()), Box::new(raw_value))
+                Value::AtKey(key, Box::new(raw_value))
             }
             Some(MapTarget::Keys) => Value::Keys(Box::new(raw_value)),
             Some(MapTarget::Values) => Value::Values(Box::new(raw_value)),
@@ -237,36 +235,36 @@ impl<'a> Parser<'a> {
         match self.peek() {
             Some(Token::MapKeys) => {
                 if field_kind != FieldKind::Map {
-                    return Err(DnfError::ParseError(ParseError::UnexpectedToken {
+                    return Err(DnfError::UnexpectedToken {
                         expected: "map field for .@keys".to_string(),
                         found: format!("{:?} field", field_kind),
                         position: self.current,
                         input: self.input.clone(),
-                    }));
+                    });
                 }
                 self.advance();
                 Ok(Some(MapTarget::Keys))
             }
             Some(Token::MapValues) => {
                 if field_kind != FieldKind::Map {
-                    return Err(DnfError::ParseError(ParseError::UnexpectedToken {
+                    return Err(DnfError::UnexpectedToken {
                         expected: "map field for .@values".to_string(),
                         found: format!("{:?} field", field_kind),
                         position: self.current,
                         input: self.input.clone(),
-                    }));
+                    });
                 }
                 self.advance();
                 Ok(Some(MapTarget::Values))
             }
             Some(Token::LeftBracket) => {
                 if field_kind != FieldKind::Map {
-                    return Err(DnfError::ParseError(ParseError::UnexpectedToken {
+                    return Err(DnfError::UnexpectedToken {
                         expected: "map field for bracket access".to_string(),
                         found: format!("{:?} field", field_kind),
                         position: self.current,
                         input: self.input.clone(),
-                    }));
+                    });
                 }
                 self.advance(); // consume '['
                 Ok(Some(MapTarget::AtKey))
@@ -276,23 +274,23 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse the key from bracket notation: ["key"]
-    fn parse_bracket_key(&mut self) -> Result<String, DnfError> {
-        let key = match self.advance() {
-            Some(Token::String(s)) => s.clone(),
+    fn parse_bracket_key(&mut self) -> Result<Box<str>, DnfError> {
+        let key: Box<str> = match self.advance() {
+            Some(Token::String(s)) => s,
             Some(token) => {
-                return Err(DnfError::ParseError(ParseError::UnexpectedToken {
+                return Err(DnfError::UnexpectedToken {
                     expected: "string key".to_string(),
                     found: token.to_string(),
                     position: self.current - 1,
                     input: self.input.clone(),
-                }));
+                });
             }
-            None => return Err(DnfError::ParseError(ParseError::UnexpectedEof)),
+            None => return Err(self.unexpected_eof()),
         };
 
         // Expect closing bracket
         if !self.match_token(&Token::RightBracket) {
-            return Err(DnfError::ParseError(ParseError::UnexpectedToken {
+            return Err(DnfError::UnexpectedToken {
                 expected: "]".to_string(),
                 found: self
                     .peek()
@@ -300,7 +298,7 @@ impl<'a> Parser<'a> {
                     .unwrap_or_else(|| "EOF".to_string()),
                 position: self.current,
                 input: self.input.clone(),
-            }));
+            });
         }
 
         Ok(key)
@@ -333,30 +331,27 @@ impl<'a> Parser<'a> {
             Some(Token::NotAnyOf) => Ok(Op::NOT_ANY_OF),
             Some(Token::Between) => Ok(Op::BETWEEN),
             Some(Token::NotBetween) => Ok(Op::NOT_BETWEEN),
-            Some(Token::CustomOp(name)) => Ok(Op::custom(name.clone())),
-            Some(token) => Err(DnfError::ParseError(ParseError::UnexpectedToken {
+            Some(Token::CustomOp(name)) => Ok(Op::custom(name)),
+            Some(token) => Err(DnfError::UnexpectedToken {
                 expected: "operator".to_string(),
                 found: token.to_string(),
                 position: self.current - 1,
                 input: self.input.clone(),
-            })),
-            None => Err(DnfError::ParseError(ParseError::UnexpectedEof)),
+            }),
+            None => Err(self.unexpected_eof()),
         }
     }
 
     /// Parse a value based on the expected field type.
     fn parse_value(&mut self, field_type: &str) -> Result<Value, DnfError> {
         let position = self.current;
-        let token = self
-            .advance()
-            .ok_or(DnfError::ParseError(ParseError::UnexpectedEof))?
-            .clone();
+        let token = self.advance().ok_or_else(|| self.unexpected_eof())?;
 
         match token {
             Token::String(s) => {
                 // String values
                 if self.is_string_type(field_type) {
-                    Ok(Value::String(Box::from(s.as_str())))
+                    Ok(Value::String(s))
                 } else {
                     Err(DnfError::TypeMismatch {
                         field: field_type.into(),
@@ -392,12 +387,12 @@ impl<'a> Parser<'a> {
                     })
                 }
             }
-            token => Err(DnfError::ParseError(ParseError::UnexpectedToken {
+            token => Err(DnfError::UnexpectedToken {
                 expected: "value".to_string(),
                 found: token.to_string(),
                 position,
                 input: self.input.clone(),
-            })),
+            }),
         }
     }
 
@@ -411,13 +406,10 @@ impl<'a> Parser<'a> {
             return self.parse_array();
         }
 
-        let token = self
-            .advance()
-            .ok_or(DnfError::ParseError(ParseError::UnexpectedEof))?
-            .clone();
+        let token = self.advance().ok_or_else(|| self.unexpected_eof())?;
 
         match token {
-            Token::String(s) => Ok(Value::String(Box::from(s.as_str()))),
+            Token::String(s) => Ok(Value::String(s)),
             Token::Number(num) => {
                 // Try to parse as different numeric types
                 if num.contains('.') || num.contains('e') || num.contains('E') {
@@ -427,7 +419,7 @@ impl<'a> Parser<'a> {
                         .map_err(|_| DnfError::TypeMismatch {
                             field: "number".into(),
                             expected: "valid number".into(),
-                            actual: num.clone().into_boxed_str(),
+                            actual: num.clone(),
                             position: Some(position),
                         })
                 } else if num.starts_with('-') {
@@ -437,7 +429,7 @@ impl<'a> Parser<'a> {
                         .map_err(|_| DnfError::TypeMismatch {
                             field: "number".into(),
                             expected: "valid integer".into(),
-                            actual: num.clone().into_boxed_str(),
+                            actual: num.clone(),
                             position: Some(position),
                         })
                 } else {
@@ -447,19 +439,19 @@ impl<'a> Parser<'a> {
                         .map_err(|_| DnfError::TypeMismatch {
                             field: "number".into(),
                             expected: "valid integer".into(),
-                            actual: num.clone().into_boxed_str(),
+                            actual: num.clone(),
                             position: Some(position),
                         })
                 }
             }
             Token::Boolean(b) => Ok(Value::Bool(b)),
             Token::Null => Ok(Value::None),
-            token => Err(DnfError::ParseError(ParseError::UnexpectedToken {
+            token => Err(DnfError::UnexpectedToken {
                 expected: "value or array".to_string(),
                 found: token.to_string(),
                 position,
                 input: self.input.clone(),
-            })),
+            }),
         }
     }
 
@@ -472,7 +464,7 @@ impl<'a> Parser<'a> {
 
         // Consume '['
         if !self.match_token(&Token::LeftBracket) {
-            return Err(DnfError::ParseError(ParseError::UnexpectedToken {
+            return Err(DnfError::UnexpectedToken {
                 expected: "[".to_string(),
                 found: self
                     .peek()
@@ -480,7 +472,7 @@ impl<'a> Parser<'a> {
                     .unwrap_or_else(|| "EOF".to_string()),
                 position: self.current,
                 input: self.input.clone(),
-            }));
+            });
         }
 
         // Determine target array type from field type
@@ -491,24 +483,18 @@ impl<'a> Parser<'a> {
         let mut values = Vec::new();
 
         // Parse first element
-        let token = self
-            .advance()
-            .ok_or(DnfError::ParseError(ParseError::UnexpectedEof))?
-            .clone();
+        let token = self.advance().ok_or_else(|| self.unexpected_eof())?;
         values.push(self.parse_number_token(&token, is_float, is_signed, is_unsigned)?);
 
         // Parse remaining elements
         while self.match_token(&Token::Comma) {
-            let token = self
-                .advance()
-                .ok_or(DnfError::ParseError(ParseError::UnexpectedEof))?
-                .clone();
+            let token = self.advance().ok_or_else(|| self.unexpected_eof())?;
             values.push(self.parse_number_token(&token, is_float, is_signed, is_unsigned)?);
         }
 
         // Consume ']'
         if !self.match_token(&Token::RightBracket) {
-            return Err(DnfError::ParseError(ParseError::UnexpectedToken {
+            return Err(DnfError::UnexpectedToken {
                 expected: "]".to_string(),
                 found: self
                     .peek()
@@ -516,7 +502,7 @@ impl<'a> Parser<'a> {
                     .unwrap_or_else(|| "EOF".to_string()),
                 position: self.current,
                 input: self.input.clone(),
-            }));
+            });
         }
 
         // Convert to appropriate Value type
@@ -527,7 +513,7 @@ impl<'a> Parser<'a> {
                     Value::Float(f) => Ok(f),
                     Value::Int(i) => Ok(i as f64),
                     Value::Uint(u) => Ok(u as f64),
-                    _ => Err(self.invalid_number_error(&v)),
+                    _ => unreachable!("parse_number_token returns only Int/Uint/Float"),
                 })
                 .collect();
             Ok(Value::FloatArray(float_values?.into_boxed_slice()))
@@ -555,7 +541,7 @@ impl<'a> Parser<'a> {
                             format!("signed integer (max {})", i64::MAX),
                             format!("unsigned integer {}", u),
                         )),
-                        _ => Err(self.invalid_number_error(&v)),
+                        _ => unreachable!("parse_number_token returns only Int/Uint/Float"),
                     })
                     .collect();
                 Ok(Value::IntArray(int_values?.into_boxed_slice()))
@@ -584,7 +570,7 @@ impl<'a> Parser<'a> {
                             "unsigned integer",
                             format!("negative integer {}", i),
                         )),
-                        _ => Err(self.invalid_number_error(&v)),
+                        _ => unreachable!("parse_number_token returns only Int/Uint/Float"),
                     })
                     .collect();
                 Ok(Value::UintArray(uint_values?.into_boxed_slice()))
@@ -613,7 +599,7 @@ impl<'a> Parser<'a> {
                             format!("signed integer (max {})", i64::MAX),
                             format!("unsigned integer {}", u),
                         )),
-                        _ => Err(self.invalid_number_error(&v)),
+                        _ => unreachable!("parse_number_token returns only Int/Uint/Float"),
                     })
                     .collect();
                 Ok(Value::IntArray(int_values?.into_boxed_slice()))
@@ -631,37 +617,37 @@ impl<'a> Parser<'a> {
         match token {
             Token::Number(num) => {
                 if is_float || num.contains('.') || num.contains('e') || num.contains('E') {
-                    num.parse::<f64>().map(Value::Float).map_err(|_| {
-                        DnfError::ParseError(ParseError::InvalidNumber {
-                            value: num.clone(),
+                    num.parse::<f64>()
+                        .map(Value::Float)
+                        .map_err(|_| DnfError::InvalidNumber {
+                            value: num.to_string(),
                             position: self.current - 1,
                             input: self.input.clone(),
                         })
-                    })
                 } else if is_signed || num.starts_with('-') {
-                    num.parse::<i64>().map(Value::Int).map_err(|_| {
-                        DnfError::ParseError(ParseError::InvalidNumber {
-                            value: num.clone(),
+                    num.parse::<i64>()
+                        .map(Value::Int)
+                        .map_err(|_| DnfError::InvalidNumber {
+                            value: num.to_string(),
                             position: self.current - 1,
                             input: self.input.clone(),
                         })
-                    })
                 } else {
-                    num.parse::<u64>().map(Value::Uint).map_err(|_| {
-                        DnfError::ParseError(ParseError::InvalidNumber {
-                            value: num.clone(),
+                    num.parse::<u64>()
+                        .map(Value::Uint)
+                        .map_err(|_| DnfError::InvalidNumber {
+                            value: num.to_string(),
                             position: self.current - 1,
                             input: self.input.clone(),
                         })
-                    })
                 }
             }
-            _ => Err(DnfError::ParseError(ParseError::UnexpectedToken {
+            _ => Err(DnfError::UnexpectedToken {
                 expected: "number".to_string(),
                 found: token.to_string(),
                 position: self.current - 1,
                 input: self.input.clone(),
-            })),
+            }),
         }
     }
 
@@ -670,7 +656,7 @@ impl<'a> Parser<'a> {
 
         // Consume '['
         if !self.match_token(&Token::LeftBracket) {
-            return Err(DnfError::ParseError(ParseError::UnexpectedToken {
+            return Err(DnfError::UnexpectedToken {
                 expected: "[".to_string(),
                 found: self
                     .peek()
@@ -678,7 +664,7 @@ impl<'a> Parser<'a> {
                     .unwrap_or_else(|| "EOF".to_string()),
                 position: self.current,
                 input: self.input.clone(),
-            }));
+            });
         }
 
         // Handle empty array
@@ -713,7 +699,7 @@ impl<'a> Parser<'a> {
 
         // Consume ']'
         if !self.match_token(&Token::RightBracket) {
-            return Err(DnfError::ParseError(ParseError::UnexpectedToken {
+            return Err(DnfError::UnexpectedToken {
                 expected: "] or ,".to_string(),
                 found: self
                     .peek()
@@ -721,7 +707,7 @@ impl<'a> Parser<'a> {
                     .unwrap_or_else(|| "EOF".to_string()),
                 position: self.current,
                 input: self.input.clone(),
-            }));
+            });
         }
 
         // Convert to appropriate array type
@@ -797,47 +783,44 @@ impl<'a> Parser<'a> {
     /// Parse a single array element (string, number, or boolean).
     fn parse_array_element(&mut self) -> Result<Value, DnfError> {
         let position = self.current;
-        let token = self
-            .advance()
-            .ok_or(DnfError::ParseError(ParseError::UnexpectedEof))?
-            .clone();
+        let token = self.advance().ok_or_else(|| self.unexpected_eof())?;
 
         match token {
-            Token::String(s) => Ok(Value::String(Box::from(s.as_str()))),
+            Token::String(s) => Ok(Value::String(s)),
             Token::Number(num) => {
                 if num.contains('.') || num.contains('e') || num.contains('E') {
-                    num.parse::<f64>().map(Value::Float).map_err(|_| {
-                        DnfError::ParseError(ParseError::InvalidNumber {
-                            value: num.clone(),
+                    num.parse::<f64>()
+                        .map(Value::Float)
+                        .map_err(|_| DnfError::InvalidNumber {
+                            value: num.to_string(),
                             position,
                             input: self.input.clone(),
                         })
-                    })
                 } else if num.starts_with('-') {
-                    num.parse::<i64>().map(Value::Int).map_err(|_| {
-                        DnfError::ParseError(ParseError::InvalidNumber {
-                            value: num.clone(),
+                    num.parse::<i64>()
+                        .map(Value::Int)
+                        .map_err(|_| DnfError::InvalidNumber {
+                            value: num.to_string(),
                             position,
                             input: self.input.clone(),
                         })
-                    })
                 } else {
-                    num.parse::<u64>().map(Value::Uint).map_err(|_| {
-                        DnfError::ParseError(ParseError::InvalidNumber {
-                            value: num.clone(),
+                    num.parse::<u64>()
+                        .map(Value::Uint)
+                        .map_err(|_| DnfError::InvalidNumber {
+                            value: num.to_string(),
                             position,
                             input: self.input.clone(),
                         })
-                    })
                 }
             }
             Token::Boolean(b) => Ok(Value::Bool(b)),
-            token => Err(DnfError::ParseError(ParseError::UnexpectedToken {
+            token => Err(DnfError::UnexpectedToken {
                 expected: "array element (string, number, or boolean)".to_string(),
                 found: token.to_string(),
                 position,
                 input: self.input.clone(),
-            })),
+            }),
         }
     }
 
@@ -863,29 +846,29 @@ impl<'a> Parser<'a> {
 
         // Parse based on field type if known, otherwise infer from value
         if is_float || num.contains('.') || num.contains('e') || num.contains('E') {
-            num.parse::<f64>().map(Value::Float).map_err(|_| {
-                DnfError::ParseError(ParseError::InvalidNumber {
+            num.parse::<f64>()
+                .map(Value::Float)
+                .map_err(|_| DnfError::InvalidNumber {
                     value: num.to_string(),
                     position,
                     input: self.input.clone(),
                 })
-            })
         } else if is_unsigned {
-            num.parse::<u64>().map(Value::Uint).map_err(|_| {
-                DnfError::ParseError(ParseError::InvalidNumber {
+            num.parse::<u64>()
+                .map(Value::Uint)
+                .map_err(|_| DnfError::InvalidNumber {
                     value: num.to_string(),
                     position,
                     input: self.input.clone(),
                 })
-            })
         } else if is_signed || num.starts_with('-') {
-            num.parse::<i64>().map(Value::Int).map_err(|_| {
-                DnfError::ParseError(ParseError::InvalidNumber {
+            num.parse::<i64>()
+                .map(Value::Int)
+                .map_err(|_| DnfError::InvalidNumber {
                     value: num.to_string(),
                     position,
                     input: self.input.clone(),
                 })
-            })
         } else {
             // No field type info - infer from value
             if let Ok(i) = num.parse::<i64>() {
@@ -893,13 +876,13 @@ impl<'a> Parser<'a> {
             } else if let Ok(u) = num.parse::<u64>() {
                 Ok(Value::Uint(u))
             } else {
-                num.parse::<f64>().map(Value::Float).map_err(|_| {
-                    DnfError::ParseError(ParseError::InvalidNumber {
+                num.parse::<f64>()
+                    .map(Value::Float)
+                    .map_err(|_| DnfError::InvalidNumber {
                         value: num.to_string(),
                         position,
                         input: self.input.clone(),
                     })
-                })
             }
         }
     }
@@ -966,11 +949,12 @@ impl<'a> Parser<'a> {
         self.tokens.get(self.current)
     }
 
-    /// Consume and return the current token.
-    fn advance(&mut self) -> Option<&Token> {
+    /// Consume and return ownership of the current token.
+    fn advance(&mut self) -> Option<Token> {
         if !self.is_at_end() {
+            let i = self.current;
             self.current += 1;
-            self.tokens.get(self.current - 1)
+            Some(std::mem::replace(&mut self.tokens[i], Token::Consumed))
         } else {
             None
         }
@@ -1194,10 +1178,7 @@ mod tests {
         let parser = Parser::new(tokens, &fields, String::new(), None);
         let result = parser.parse();
 
-        assert!(matches!(
-            result,
-            Err(DnfError::ParseError(ParseError::EmptyQuery))
-        ));
+        assert!(matches!(result, Err(DnfError::EmptyQuery)));
     }
 
     // ==================== Array Tests ====================

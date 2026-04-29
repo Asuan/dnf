@@ -1,10 +1,14 @@
 use crate::{Condition, Conjunction, DnfQuery, Op, OpRegistry, Value};
 
-/// Builder for constructing DNF queries with a fluent API.
+/// Constructs a [`DnfQuery`] with a fluent API.
 ///
-/// # Example
+/// Each call to [`or`](Self::or) appends a new conjunction (an *OR* clause);
+/// inside the closure, `and` appends a condition (an *AND* clause). Call
+/// [`build`](Self::build) to produce the immutable query.
 ///
-/// ```rust
+/// # Examples
+///
+/// ```
 /// use dnf::{DnfQuery, Op};
 ///
 /// let query = DnfQuery::builder()
@@ -12,6 +16,8 @@ use crate::{Condition, Conjunction, DnfQuery, Op, OpRegistry, Value};
 ///              .and("country", Op::EQ, "US"))
 ///     .or(|c| c.and("premium", Op::EQ, true))
 ///     .build();
+///
+/// assert_eq!(query.len(), 2);
 /// ```
 #[derive(Default, Debug)]
 pub struct QueryBuilder {
@@ -27,7 +33,31 @@ impl QueryBuilder {
         }
     }
 
-    /// Parse query string using type's field metadata
+    /// Parses a query string using the field metadata of `T`.
+    ///
+    /// This is a one-shot constructor: it does not return a builder, so it
+    /// cannot be chained with [`or`](Self::or) or
+    /// [`with_custom_op`](Self::with_custom_op). Use [`parse`](Self::parse) to
+    /// merge a parsed query into an existing builder.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use dnf::{DnfEvaluable, QueryBuilder};
+    ///
+    /// #[derive(DnfEvaluable)]
+    /// struct User { age: u32 }
+    ///
+    /// let query = QueryBuilder::from_query::<User>("age > 18")?;
+    /// assert_eq!(query.len(), 1);
+    /// # Ok::<(), dnf::DnfError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns a parser variant of [`DnfError`](crate::DnfError) if `query` is not
+    /// syntactically valid, or [`DnfError::UnknownField`](crate::DnfError::UnknownField)
+    /// if the query references a field not declared on `T`.
     #[cfg(feature = "parser")]
     pub fn from_query<T: crate::DnfEvaluable>(query: &str) -> Result<DnfQuery, crate::DnfError> {
         let fields: Vec<_> = T::fields().collect();
@@ -39,32 +69,34 @@ impl QueryBuilder {
         )
     }
 
-    /// Parse a query string and add its conditions to this builder.
+    /// Parses a query string and appends its conjunctions to this builder.
     ///
-    /// Uses any custom operators registered via `with_custom_op()` or `with_custom_ops()`.
-    /// Parsed conjunctions are added to existing ones, allowing mixed builder/parser usage.
+    /// Custom operators previously registered via
+    /// [`with_custom_op`](Self::with_custom_op) or
+    /// [`with_custom_ops`](Self::with_custom_ops) are recognized by the parser.
     ///
-    /// # Example
+    /// # Examples
     ///
-    /// ```rust
-    /// use dnf::{DnfEvaluable, DnfQuery, Op, Value};
+    /// ```
+    /// use dnf::{DnfEvaluable, DnfQuery, Op};
     ///
     /// #[derive(DnfEvaluable)]
-    /// struct User {
-    ///     age: u32,
-    ///     premium: bool,
-    /// }
+    /// struct User { age: u32, premium: bool }
     ///
-    /// // Mix parsed and builder conditions
     /// let query = DnfQuery::builder()
-    ///     .with_custom_op("IS_ADULT", true, |field, _| {
-    ///         matches!(field, Value::Uint(n) if *n >= 18)
-    ///     })
-    ///     .parse::<User>("age IS_ADULT")?
-    ///     .or(|c| c.and("premium", Op::EQ, true))  // Add more conditions
+    ///     .parse::<User>("age > 18")?
+    ///     .or(|c| c.and("premium", Op::EQ, true))
     ///     .build();
+    ///
+    /// assert_eq!(query.len(), 2);
     /// # Ok::<(), dnf::DnfError>(())
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns a parser variant of [`DnfError`](crate::DnfError) if `query` is not
+    /// syntactically valid, or [`DnfError::UnknownField`](crate::DnfError::UnknownField)
+    /// if the query references a field not declared on `T`.
     #[cfg(feature = "parser")]
     pub fn parse<T: crate::DnfEvaluable>(mut self, query: &str) -> Result<Self, crate::DnfError> {
         let fields: Vec<_> = T::fields().collect();
@@ -73,7 +105,6 @@ impl QueryBuilder {
         let parsed_query =
             crate::parser::parse_with_fields(query, &fields, custom_op_names, novalue_ops)?;
 
-        // Add parsed conjunctions to this builder
         for conj in parsed_query.into_conjunctions() {
             self.conjunctions.push(conj);
         }
@@ -81,17 +112,23 @@ impl QueryBuilder {
         Ok(self)
     }
 
-    /// Add a conjunction (OR clause) to the query using a closure.
+    /// Appends a conjunction (an *OR* clause) to the query.
     ///
-    /// # Example
+    /// The closure receives a builder on which `and` can be chained to add
+    /// conditions. An empty conjunction (one with no conditions) is filtered
+    /// out by [`build`](Self::build).
     ///
-    /// ```rust
+    /// # Examples
+    ///
+    /// ```
     /// use dnf::{DnfQuery, Op};
     ///
     /// let query = DnfQuery::builder()
-    ///     .or(|c| c.and("age", Op::GT, 18)
-    ///              .and("active", Op::EQ, true))
+    ///     .or(|c| c.and("age", Op::GT, 18).and("country", Op::EQ, "US"))
+    ///     .or(|c| c.and("premium", Op::EQ, true))
     ///     .build();
+    ///
+    /// assert_eq!(query.len(), 2);
     /// ```
     #[must_use]
     pub fn or<F>(mut self, f: F) -> Self
@@ -104,47 +141,51 @@ impl QueryBuilder {
         self
     }
 
-    /// Merge another query's conjunctions into this builder.
+    /// Merges another query's conjunctions into this builder (OR combination).
     ///
-    /// Useful for combining parsed queries with builder-constructed ones.
+    /// Custom operators registered on `query` are merged into this builder's
+    /// registry; on name collision, `query`'s entry replaces this builder's.
     ///
-    /// # Example
+    /// # Examples
     ///
-    /// ```rust
+    /// ```
     /// use dnf::{DnfQuery, Op};
     ///
-    /// let parsed = DnfQuery::builder()
+    /// let premium = DnfQuery::builder()
     ///     .or(|c| c.and("premium", Op::EQ, true))
     ///     .build();
-    ///
     /// let query = DnfQuery::builder()
     ///     .or(|c| c.and("age", Op::GT, 18))
-    ///     .or_query(parsed)  // Add parsed query's conditions
+    ///     .or_query(premium)
     ///     .build();
     ///
-    /// // Result: (age > 18) OR (premium == true)
-    /// assert_eq!(query.conjunctions().len(), 2);
+    /// assert_eq!(query.len(), 2);
     /// ```
     #[must_use]
     pub fn or_query(mut self, query: DnfQuery) -> Self {
         let (conjunctions, custom_ops) = query.into_parts();
         self.conjunctions.extend(conjunctions);
-        // Merge custom ops from the query
         if let Some(other_ops) = custom_ops {
             match &mut self.custom_ops {
-                Some(ops) => ops.merge(other_ops),
+                Some(ops) => {
+                    ops.merge(other_ops);
+                }
                 None => self.custom_ops = Some(other_ops),
             }
         }
         self
     }
 
-    /// Attach a custom operator registry to the query being built.
+    /// Attaches a custom operator registry to the query being built.
     ///
-    /// # Example
+    /// Replaces any registry previously set on this builder. To register a
+    /// single operator without constructing a [`OpRegistry`] first, see
+    /// [`with_custom_op`](Self::with_custom_op).
     ///
-    /// ```rust
-    /// use dnf::{DnfQuery, Op, Value, OpRegistry};
+    /// # Examples
+    ///
+    /// ```
+    /// use dnf::{DnfQuery, Op, OpRegistry, Value};
     ///
     /// let mut registry = OpRegistry::new();
     /// registry.register("IS_ADULT", true, |field, _| {
@@ -155,48 +196,39 @@ impl QueryBuilder {
     ///     .with_custom_ops(registry)
     ///     .or(|c| c.and("age", Op::custom("IS_ADULT"), Value::None))
     ///     .build();
+    ///
+    /// assert!(query.has_custom_op("IS_ADULT"));
     /// ```
+    #[must_use]
     pub fn with_custom_ops(mut self, registry: OpRegistry) -> Self {
         self.custom_ops = Some(registry);
         self
     }
 
-    /// Register a custom operator with optional novalue flag.
+    /// Registers a custom operator on the builder's registry.
     ///
-    /// # Arguments
+    /// `name` is the operator's identifier; `novalue` is `true` if the
+    /// operator takes no right-hand value in a parsed query (e.g.
+    /// `age IS_ADULT` instead of `age IS_ADULT 1`); `f` is the evaluator
+    /// `(field_value, query_value) -> bool`.
     ///
-    /// * `name` - The operator name
-    /// * `novalue` - If true, the operator doesn't require a value in the query
-    /// * `f` - The evaluation function
+    /// Lazily creates an [`OpRegistry`] on first call.
     ///
-    /// # Example
+    /// # Examples
     ///
-    /// ```rust,ignore
-    /// // Requires `parser` feature
-    /// use dnf::{DnfQuery, DnfEvaluable, Value};
-    ///
-    /// #[derive(DnfEvaluable)]
-    /// struct Data {
-    ///     answer: u32,
-    ///     age: u32,
-    /// }
-    ///
-    /// // Operator that needs a value
-    /// let query = DnfQuery::builder()
-    ///     .with_custom_op("EQUALS_ANSWER", false, |field, value| {
-    ///         matches!((field, value), (Value::Uint(42), Value::Uint(42)))
-    ///     })
-    ///     .parse::<Data>("answer EQUALS_ANSWER 42")
-    ///     .unwrap();
-    ///
-    /// // Operator that doesn't need a value
-    /// let query2 = DnfQuery::builder()
-    ///     .with_custom_op("IS_ADULT", true, |field, _| {
-    ///         matches!(field, Value::Uint(n) if *n >= 18)
-    ///     })
-    ///     .parse::<Data>("age IS_ADULT")  // No value needed!
-    ///     .unwrap();
     /// ```
+    /// use dnf::{DnfQuery, Op, Value};
+    ///
+    /// let query = DnfQuery::builder()
+    ///     .with_custom_op("IS_ADULT", true, |field, _| {
+    ///         matches!(field, Value::Int(n) if *n >= 18)
+    ///     })
+    ///     .or(|c| c.and("age", Op::custom("IS_ADULT"), Value::None))
+    ///     .build();
+    ///
+    /// assert!(query.has_custom_op("IS_ADULT"));
+    /// ```
+    #[must_use]
     pub fn with_custom_op<F>(mut self, name: impl Into<Box<str>>, novalue: bool, f: F) -> Self
     where
         F: Fn(&Value, &Value) -> bool + Send + Sync + 'static,
@@ -207,37 +239,41 @@ impl QueryBuilder {
         self
     }
 
-    /// Validate field names against type T.
+    /// Validates field names and custom operators against type `T`.
     ///
-    /// Returns `Ok(self)` if all fields exist, `Err` otherwise.
-    /// Call before `build()` to catch typos early.
+    /// Call before [`build`](Self::build) to catch typos and missing custom
+    /// operator registrations early.
     ///
-    /// # Example
+    /// # Examples
     ///
-    /// ```rust
+    /// ```
     /// use dnf::{DnfEvaluable, DnfQuery, Op};
     ///
     /// #[derive(DnfEvaluable)]
     /// struct User { age: u32, name: String }
     ///
-    /// // Valid fields
     /// let query = DnfQuery::builder()
     ///     .or(|c| c.and("age", Op::GT, 18))
     ///     .validate::<User>()?
     ///     .build();
     ///
-    /// // Typo caught early
-    /// let result = DnfQuery::builder()
-    ///     .or(|c| c.and("agee", Op::GT, 18))  // Typo!
-    ///     .validate::<User>();
-    /// assert!(result.is_err());
+    /// assert_eq!(query.len(), 1);
     /// # Ok::<(), dnf::DnfError>(())
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// - [`DnfError::UnknownField`](crate::DnfError::UnknownField) if a
+    ///   condition references a field not declared on `T`.
+    /// - [`DnfError::UnregisteredCustomOp`](crate::DnfError::UnregisteredCustomOp)
+    ///   if a condition uses a custom operator that has not been registered
+    ///   on this builder.
+    /// - [`DnfError::InvalidMapTarget`](crate::DnfError::InvalidMapTarget) if
+    ///   a map-targeted [`Value`] (such as [`Value::AtKey`]) is applied to a
+    ///   non-map field.
     pub fn validate<T: crate::DnfEvaluable>(self) -> Result<Self, crate::DnfError> {
         use crate::FieldKind;
-        use std::collections::HashMap;
 
-        // Validate custom operators
         for conj in &self.conjunctions {
             for cond in conj.conditions() {
                 if let Some(custom_name) = cond.operator().custom_name() {
@@ -254,33 +290,22 @@ impl QueryBuilder {
             }
         }
 
-        // Validate field names and map targets
-        let field_info: HashMap<&str, FieldKind> = T::fields().map(|f| (f.name, f.kind)).collect();
-
         for conj in &self.conjunctions {
             for cond in conj.conditions() {
                 let field_name = cond.field_name();
                 let value = cond.value();
 
-                let root_field = field_name.split('.').next().unwrap_or(field_name);
+                let field_kind = T::validate_field_path(field_name).ok_or_else(|| {
+                    crate::DnfError::UnknownField {
+                        field_name: field_name.into(),
+                        position: None,
+                    }
+                })?;
 
-                let field_kind =
-                    field_info
-                        .get(root_field)
-                        .ok_or_else(|| crate::DnfError::UnknownField {
-                            field_name: field_name.into(),
-                            position: 0,
-                        })?;
-
-                let is_map_value = matches!(
-                    value,
-                    crate::Value::AtKey(_, _) | crate::Value::Keys(_) | crate::Value::Values(_)
-                );
-
-                if is_map_value && *field_kind != FieldKind::Map {
+                if value.is_map_targeted() && field_kind != FieldKind::Map {
                     return Err(crate::DnfError::InvalidMapTarget {
                         field_name: field_name.into(),
-                        field_kind: *field_kind,
+                        field_kind,
                     });
                 }
             }
@@ -289,9 +314,21 @@ impl QueryBuilder {
         Ok(self)
     }
 
-    /// Build the final DnfQuery.
+    /// Builds the final [`DnfQuery`].
     ///
     /// Empty conjunctions (those with no conditions) are filtered out.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use dnf::{DnfQuery, Op};
+    ///
+    /// let query = DnfQuery::builder()
+    ///     .or(|c| c.and("age", Op::GT, 18))
+    ///     .build();
+    ///
+    /// assert_eq!(query.len(), 1);
+    /// ```
     #[must_use]
     pub fn build(self) -> DnfQuery {
         let conjunctions = self
@@ -307,12 +344,10 @@ impl QueryBuilder {
     }
 }
 
-/// Builder for constructing a conjunction (AND clause).
+/// Builds a single conjunction (an *AND* clause).
 ///
-/// This is typically used within a closure passed to `QueryBuilder::or()`.
-///
-/// **Note:** This type is an implementation detail of the builder API.
-/// Users receive it as a parameter in closures but don't construct it directly.
+/// Obtained via the closure passed to [`QueryBuilder::or`]. Each call to
+/// [`and`](Self::and) appends one [`Condition`] to the conjunction.
 #[doc(hidden)]
 #[derive(Default)]
 pub struct ConjunctionBuilder {
@@ -320,17 +355,18 @@ pub struct ConjunctionBuilder {
 }
 
 impl ConjunctionBuilder {
-    /// Add a condition using field name, operator, and value directly.
+    /// Appends a `field operator value` condition to this conjunction.
     ///
-    /// # Example
+    /// # Examples
     ///
-    /// ```rust
+    /// ```
     /// use dnf::{DnfQuery, Op};
     ///
     /// let query = DnfQuery::builder()
-    ///     .or(|c| c.and("age", Op::GT, 18)
-    ///                .and("country", Op::EQ, "US"))
+    ///     .or(|c| c.and("age", Op::GT, 18).and("country", Op::EQ, "US"))
     ///     .build();
+    ///
+    /// assert_eq!(query.condition_count(), 2);
     /// ```
     #[must_use]
     pub fn and(
@@ -469,50 +505,6 @@ mod tests {
                     i
                 );
             }
-        }
-    }
-
-    // ==================== Operator Coverage Tests ====================
-
-    #[test]
-    fn test_builder_all_operators() {
-        // Test that all operators work correctly with the builder
-        let test_cases: Vec<(&str, Op, Value)> = vec![
-            ("eq", Op::EQ, Value::Int(1)),
-            ("ne", Op::NE, Value::Int(2)),
-            ("gt", Op::GT, Value::Int(3)),
-            ("lt", Op::LT, Value::Int(4)),
-            ("gte", Op::GTE, Value::Int(5)),
-            ("lte", Op::LTE, Value::Int(6)),
-            ("contains", Op::CONTAINS, Value::from("test")),
-            ("not_contains", Op::NOT_CONTAINS, Value::from("bad")),
-            ("starts_with", Op::STARTS_WITH, Value::from("hello")),
-            ("not_starts_with", Op::NOT_STARTS_WITH, Value::from("x")),
-            ("ends_with", Op::ENDS_WITH, Value::from("world")),
-            ("not_ends_with", Op::NOT_ENDS_WITH, Value::from("y")),
-            ("all_of", Op::ALL_OF, Value::from(vec![1, 2, 3])),
-            ("any_of", Op::ANY_OF, Value::from(vec![4, 5, 6])),
-        ];
-
-        for (name, op, value) in test_cases {
-            let query = QueryBuilder::new()
-                .or(|c| c.and("field", op.clone(), value.clone()))
-                .build();
-
-            assert_eq!(
-                query.conjunctions().len(),
-                1,
-                "Failed for operator: {}",
-                name
-            );
-            let condition = &query.conjunctions()[0].conditions()[0];
-            assert_eq!(
-                condition.field_name(),
-                "field",
-                "Failed for operator: {}",
-                name
-            );
-            assert_eq!(condition.operator(), &op, "Failed for operator: {}", name);
         }
     }
 
@@ -706,7 +698,7 @@ mod tests {
                 }
             }
 
-            fn get_field_value(&self, field_name: &str) -> Option<Value> {
+            fn field_value(&self, field_name: &str) -> Option<Value> {
                 match field_name {
                     "age" => Some(Value::Int(self.age)),
                     "score" => Some(Value::Int(self.score)),

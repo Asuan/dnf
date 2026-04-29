@@ -1,31 +1,29 @@
 use crate::{DnfEvaluable, Op, OpRegistry, Value};
 use std::fmt;
 
-/// Represents a single condition in a DNF query.
+/// Represents a single `field operator value` test in a DNF query.
 ///
-/// A condition checks if a field satisfies a comparison with a value.
+/// Conditions are the leaves of a query: a [`Conjunction`] is an `AND` of
+/// conditions, and a [`DnfQuery`] is an `OR` of conjunctions.
 ///
-/// # Example
+/// # Examples
 ///
-/// ```rust
+/// ```
 /// use dnf::{DnfQuery, Op};
 ///
 /// let query = DnfQuery::builder()
 ///     .or(|c| c.and("age", Op::GT, 18))
 ///     .build();
 ///
-/// // Access condition details
 /// let condition = &query.conjunctions()[0].conditions()[0];
 /// assert_eq!(condition.field_name(), "age");
+/// assert_eq!(condition.operator(), &Op::GT);
 /// ```
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Condition {
-    /// The name of the field to check
     field_name: Box<str>,
-    /// The comparison operator
     operator: Op,
-    /// The value to compare against
     value: Value,
 }
 
@@ -42,18 +40,44 @@ impl Condition {
         }
     }
 
+    /// Returns the field name this condition tests.
     pub fn field_name(&self) -> &str {
         &self.field_name
     }
 
+    /// Returns the operator used by this condition.
     pub fn operator(&self) -> &Op {
         &self.operator
     }
 
+    /// Returns the right-hand value this condition compares against.
     pub fn value(&self) -> &Value {
         &self.value
     }
 
+    /// Evaluates the condition against a single target.
+    ///
+    /// Returns whatever [`DnfEvaluable::evaluate_field`] returns. Custom
+    /// operators are *not* dispatched here — call
+    /// [`DnfQuery::evaluate`] for that.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use dnf::{Condition, DnfEvaluable, Op, Value};
+    ///
+    /// #[derive(DnfEvaluable)]
+    /// struct User { age: u32 }
+    ///
+    /// let user = User { age: 30 };
+    /// let cond = dnf::DnfQuery::builder()
+    ///     .or(|c| c.and("age", Op::GT, 18))
+    ///     .build()
+    ///     .conjunctions()[0]
+    ///     .conditions()[0]
+    ///     .clone();
+    /// assert!(cond.evaluate(&user));
+    /// ```
     pub fn evaluate<T: DnfEvaluable>(&self, target: &T) -> bool {
         target.evaluate_field(&self.field_name, &self.operator, &self.value)
     }
@@ -65,37 +89,60 @@ impl fmt::Display for Condition {
     }
 }
 
-/// Conjunction (AND) of conditions. Use builder API for construction.
+/// An `AND` of [`Condition`]s — one clause inside a [`DnfQuery`].
 ///
-/// # Recommended Alternative
+/// Construct conjunctions through [`DnfQuery::builder`]; the public surface
+/// here exists for inspection and serialization.
 ///
-/// ```rust
+/// # Examples
+///
+/// ```
 /// use dnf::{DnfQuery, Op};
 ///
 /// let query = DnfQuery::builder()
-///     .or(|c| c.and("age", Op::GT, 18)
-///              .and("country", Op::EQ, "US"))
+///     .or(|c| c.and("age", Op::GT, 18).and("country", Op::EQ, "US"))
 ///     .build();
+///
+/// let conj = &query.conjunctions()[0];
+/// assert_eq!(conj.len(), 2);
 /// ```
 #[derive(Debug, Clone, PartialEq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Conjunction {
-    /// The conditions in this conjunction
     conditions: Vec<Condition>,
 }
 
 impl Conjunction {
-    /// Create a conjunction from a vector of conditions (internal use only).
-    ///
     pub(crate) fn from_conditions(conditions: Vec<Condition>) -> Self {
         Self { conditions }
     }
 
+    /// Returns the conditions joined by `AND`.
     pub fn conditions(&self) -> &[Condition] {
         &self.conditions
     }
 
-    /// Returns true if ALL conditions satisfied (empty = true)
+    /// Evaluates the conjunction against a target.
+    ///
+    /// Returns `true` if every condition matches. An empty conjunction is
+    /// vacuously `true`; the builder filters those out, so a `true` result here
+    /// only happens for an empty conjunction created by deserialization or by
+    /// internal APIs.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use dnf::{DnfEvaluable, DnfQuery, Op};
+    ///
+    /// #[derive(DnfEvaluable)]
+    /// struct User { age: u32, premium: bool }
+    ///
+    /// let user = User { age: 30, premium: true };
+    /// let query = DnfQuery::builder()
+    ///     .or(|c| c.and("age", Op::GT, 18).and("premium", Op::EQ, true))
+    ///     .build();
+    /// assert!(query.conjunctions()[0].evaluate(&user));
+    /// ```
     pub fn evaluate<T: DnfEvaluable>(&self, target: &T) -> bool {
         if self.conditions.is_empty() {
             return true;
@@ -105,10 +152,15 @@ impl Conjunction {
             .all(|condition| condition.evaluate(target))
     }
 
+    /// Returns the number of conditions in this conjunction.
     pub fn len(&self) -> usize {
         self.conditions.len()
     }
 
+    /// Returns `true` if this conjunction has no conditions.
+    ///
+    /// An empty conjunction is vacuously satisfied — see
+    /// [`evaluate`](Self::evaluate).
     pub fn is_empty(&self) -> bool {
         self.conditions.is_empty()
     }
@@ -125,38 +177,43 @@ impl fmt::Display for Conjunction {
     }
 }
 
-/// DNF query: OR of AND clauses. Use builder API for construction.
+/// A query in disjunctive normal form: an `OR` of [`Conjunction`]s.
 ///
-/// ```rust
-/// use dnf::{DnfQuery, Op};
+/// Construct with [`DnfQuery::builder`] or, with the `parser` feature, with
+/// [`QueryBuilder::from_query`](crate::QueryBuilder::from_query).
 ///
+/// # Examples
+///
+/// ```
+/// use dnf::{DnfEvaluable, DnfQuery, Op};
+///
+/// #[derive(DnfEvaluable)]
+/// struct User { age: u32, country: String, premium: bool }
+///
+/// let user = User { age: 30, country: "US".into(), premium: false };
 /// let query = DnfQuery::builder()
-///     .or(|c| c.and("age", Op::GT, 18)
-///              .and("country", Op::EQ, "US"))
+///     .or(|c| c.and("age", Op::GT, 18).and("country", Op::EQ, "US"))
 ///     .or(|c| c.and("premium", Op::EQ, true))
 ///     .build();
+/// assert!(query.evaluate(&user));
 /// ```
+#[cfg_attr(not(feature = "parser"), allow(rustdoc::broken_intra_doc_links))]
 #[derive(Debug, Clone, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct DnfQuery {
-    /// The conjunctions in this DNF query
     conjunctions: Vec<Conjunction>,
-    /// Custom operator registry (skipped in serialization and comparison)
     #[cfg_attr(feature = "serde", serde(skip))]
     custom_ops: Option<OpRegistry>,
 }
 
 impl PartialEq for DnfQuery {
     fn eq(&self, other: &Self) -> bool {
-        // Compare only conjunctions, not custom_ops (functions can't be compared)
+        // custom_ops holds function pointers, which have no equality.
         self.conjunctions == other.conjunctions
     }
 }
 
 impl DnfQuery {
-    /// Create a DNF query from a vector of conjunctions (internal use only).
-    ///
-    /// Use [`DnfQuery::builder()`](DnfQuery::builder) for constructing queries.
     pub(crate) fn from_conjunctions(conjunctions: Vec<Conjunction>) -> Self {
         Self {
             conjunctions,
@@ -164,89 +221,75 @@ impl DnfQuery {
         }
     }
 
-    /// Set custom operators (internal use only - called from builder).
-    ///
-    /// Use [`DnfQuery::builder()`](DnfQuery::builder) for custom_ops.
     pub(crate) fn set_custom_ops(mut self, registry: OpRegistry) -> Self {
         self.custom_ops = Some(registry);
         self
     }
 
-    /// Get the conjunctions in this query.
+    /// Returns the conjunctions joined by `OR`.
     pub fn conjunctions(&self) -> &[Conjunction] {
         &self.conjunctions
     }
 
-    /// Take ownership of the conjunctions and custom ops.
     pub(crate) fn into_parts(self) -> (Vec<Conjunction>, Option<OpRegistry>) {
         (self.conjunctions, self.custom_ops)
     }
 
-    /// Take ownership of the conjunctions (internal use).
     #[cfg(feature = "parser")]
     pub(crate) fn into_conjunctions(self) -> Vec<Conjunction> {
         self.conjunctions
     }
 
-    /// Create a new query builder.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use dnf::{DnfQuery, Op};
-    ///
-    /// let query = DnfQuery::builder()
-    ///     .or(|c| c.and("age", Op::GT, 18)
-    ///              .and("country", Op::EQ, "US"))
-    ///     .or(|c| c.and("premium", Op::EQ, true))
-    ///     .build();
-    /// ```
+    /// Returns a new [`QueryBuilder`](crate::QueryBuilder) for fluent construction.
     pub fn builder() -> crate::builder::QueryBuilder {
         crate::builder::QueryBuilder::new()
     }
 
-    /// Get the custom operator registry, if any.
+    /// Returns the attached custom-operator registry, or `None` if none was set.
     pub fn custom_ops(&self) -> Option<&OpRegistry> {
         self.custom_ops.as_ref()
     }
 
-    /// Check if a custom operator is registered.
+    /// Returns `true` if a custom operator with `name` is registered.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use dnf::{DnfQuery, Op, Value};
+    ///
+    /// let query = DnfQuery::builder()
+    ///     .with_custom_op("IS_ADULT", true, |f, _| matches!(f, Value::Uint(n) if *n >= 18))
+    ///     .or(|c| c.and("age", Op::custom("IS_ADULT"), Value::None))
+    ///     .build();
+    /// assert!(query.has_custom_op("IS_ADULT"));
+    /// assert!(!query.has_custom_op("MISSING"));
+    /// ```
     pub fn has_custom_op(&self, name: &str) -> bool {
         self.custom_ops.as_ref().is_some_and(|r| r.contains(name))
     }
 
-    /// Validate that all custom operators used in the query are registered.
+    /// Verifies every custom operator used in the query is registered.
     ///
-    /// Returns `Ok(())` if all custom operators are registered,
-    /// or `Err(DnfError::UnregisteredCustomOp)` with the first unregistered operator found.
+    /// # Errors
     ///
-    /// # Example
+    /// Returns [`DnfError::UnregisteredCustomOp`](crate::DnfError::UnregisteredCustomOp)
+    /// for the first condition referencing an operator that has not been
+    /// registered.
     ///
-    /// ```rust
+    /// # Examples
+    ///
+    /// ```
     /// use dnf::{DnfQuery, Op, Value};
     ///
-    /// let query = DnfQuery::builder()
-    ///     .with_custom_op("IS_ADULT", true, |field, _| {
-    ///         matches!(field, Value::Uint(n) if *n >= 18)
-    ///     })
-    ///     .or(|c| c.and("age", Op::custom("IS_ADULT"), Value::None))
-    ///     .build();
-    ///
-    /// // Validation passes - operator is registered
-    /// assert!(query.validate_custom_ops().is_ok());
-    ///
-    /// let bad_query = DnfQuery::builder()
+    /// let bad = DnfQuery::builder()
     ///     .or(|c| c.and("age", Op::custom("IS_SENIOR"), Value::None))
     ///     .build();
-    ///
-    /// // Validation fails - operator not registered
-    /// assert!(bad_query.validate_custom_ops().is_err());
+    /// assert!(bad.validate_custom_ops().is_err());
     /// ```
     pub fn validate_custom_ops(&self) -> Result<(), crate::DnfError> {
         for conjunction in &self.conjunctions {
             for condition in &conjunction.conditions {
                 if let Some(custom_name) = condition.operator.custom_name() {
-                    // Check if operator is registered
                     if !self.has_custom_op(custom_name) {
                         return Err(crate::DnfError::UnregisteredCustomOp {
                             operator_name: custom_name.into(),
@@ -258,28 +301,34 @@ impl DnfQuery {
         Ok(())
     }
 
-    /// Evaluate this query against a target object.
+    /// Evaluates the query against a target.
     ///
-    /// Returns `true` if ANY conjunction is satisfied, `false` otherwise.
+    /// Returns `true` if any conjunction matches. Short-circuits on the first
+    /// matching conjunction; standard operators compare directly without
+    /// converting fields to [`Value`], while custom operators convert only the
+    /// fields they touch.
     ///
-    /// # Custom Operators
+    /// # Examples
     ///
-    /// If the query uses custom operators (via `Op::custom("name")`), they are
-    /// evaluated using functions registered via `with_custom_op` or `with_custom_ops`.
-    /// Unregistered custom operators evaluate to `false`.
+    /// ```
+    /// use dnf::{DnfEvaluable, DnfQuery, Op};
     ///
-    /// # Performance
+    /// #[derive(DnfEvaluable)]
+    /// struct User { age: u32, premium: bool }
     ///
-    /// - Uses short-circuit evaluation (stops on first matching conjunction)
-    /// - Standard operators use direct comparison (no Value conversion)
-    /// - Custom operators convert field values only when evaluated
+    /// let user = User { age: 30, premium: false };
+    /// let query = DnfQuery::builder()
+    ///     .or(|c| c.and("age", Op::GT, 18))
+    ///     .or(|c| c.and("premium", Op::EQ, true))
+    ///     .build();
+    /// assert!(query.evaluate(&user));
+    /// ```
     pub fn evaluate<T: DnfEvaluable>(&self, target: &T) -> bool {
         self.conjunctions
             .iter()
             .any(|conjunction| self.evaluate_conjunction(conjunction, target))
     }
 
-    /// Evaluate a conjunction against a target.
     fn evaluate_conjunction<T: DnfEvaluable>(&self, conj: &Conjunction, target: &T) -> bool {
         if conj.conditions.is_empty() {
             return true;
@@ -289,13 +338,10 @@ impl DnfQuery {
             .all(|cond| self.evaluate_condition(cond, target))
     }
 
-    /// Evaluate a condition against a target.
     fn evaluate_condition<T: DnfEvaluable>(&self, cond: &Condition, target: &T) -> bool {
-        // Check for custom operator
         if let Some(custom_name) = cond.operator.custom_name() {
             if let Some(registry) = &self.custom_ops {
-                // Only convert field to Value when we have a custom op with registry
-                if let Some(field_value) = target.get_field_value(&cond.field_name) {
+                if let Some(field_value) = target.field_value(&cond.field_name) {
                     let result = registry
                         .evaluate(custom_name, &field_value, &cond.value)
                         .unwrap_or(false);
@@ -306,44 +352,37 @@ impl DnfQuery {
                     };
                 }
             }
-            // No registry or field not found
             return cond.operator.is_inverse();
         }
 
-        // Standard operators - direct evaluation without Value conversion
         target.evaluate_field(&cond.field_name, &cond.operator, &cond.value)
     }
 
-    /// Returns the number of conjunctions in this query.
+    /// Returns the number of conjunctions in the query.
     pub fn len(&self) -> usize {
         self.conjunctions.len()
     }
 
-    /// Check if this query has no conjunctions.
+    /// Returns `true` if the query has no conjunctions and therefore matches nothing.
     pub fn is_empty(&self) -> bool {
         self.conjunctions.is_empty()
     }
 
-    /// Get all field names used in this query.
+    /// Returns an iterator over every field name referenced by the query.
     ///
-    /// Returns an iterator over field names. Use `.collect::<HashSet<_>>()` for unique names.
+    /// Names appear with duplicates in the order they were added; collect into
+    /// a `HashSet` if you need uniqueness.
     ///
-    /// # Example
+    /// # Examples
     ///
-    /// ```rust
+    /// ```
     /// use dnf::{DnfQuery, Op};
-    /// use std::collections::HashSet;
     ///
     /// let query = DnfQuery::builder()
-    ///     .or(|c| c.and("age", Op::GT, 18)
-    ///              .and("country", Op::EQ, "US"))
-    ///     .or(|c| c.and("premium", Op::EQ, true))
+    ///     .or(|c| c.and("age", Op::GT, 18).and("country", Op::EQ, "US"))
     ///     .build();
-    ///
-    /// let fields: HashSet<_> = query.field_names().collect();
-    /// assert!(fields.contains("age"));
-    /// assert!(fields.contains("country"));
-    /// assert!(fields.contains("premium"));
+    /// let names: Vec<_> = query.field_names().collect();
+    /// assert_eq!(names, vec!["age", "country"]);
     /// ```
     pub fn field_names(&self) -> impl Iterator<Item = &str> {
         self.conjunctions
@@ -351,36 +390,31 @@ impl DnfQuery {
             .flat_map(|conj| conj.conditions().iter().map(|c| c.field_name()))
     }
 
-    /// Get the total number of conditions across all conjunctions.
+    /// Returns the total number of conditions across all conjunctions.
     ///
-    /// # Example
+    /// # Examples
     ///
-    /// ```rust
+    /// ```
     /// use dnf::{DnfQuery, Op};
     ///
     /// let query = DnfQuery::builder()
-    ///     .or(|c| c.and("age", Op::GT, 18)
-    ///              .and("country", Op::EQ, "US"))
-    ///     .or(|c| c.and("premium", Op::EQ, true))
+    ///     .or(|c| c.and("a", Op::EQ, 1).and("b", Op::EQ, 2))
+    ///     .or(|c| c.and("c", Op::EQ, 3))
     ///     .build();
-    ///
     /// assert_eq!(query.condition_count(), 3);
     /// ```
     pub fn condition_count(&self) -> usize {
         self.conjunctions.iter().map(|c| c.len()).sum()
     }
 
-    /// Check if this query uses a specific field.
+    /// Returns `true` if any condition references `name`.
     ///
-    /// # Example
+    /// # Examples
     ///
-    /// ```rust
+    /// ```
     /// use dnf::{DnfQuery, Op};
     ///
-    /// let query = DnfQuery::builder()
-    ///     .or(|c| c.and("age", Op::GT, 18))
-    ///     .build();
-    ///
+    /// let query = DnfQuery::builder().or(|c| c.and("age", Op::GT, 18)).build();
     /// assert!(query.uses_field("age"));
     /// assert!(!query.uses_field("name"));
     /// ```
@@ -390,120 +424,83 @@ impl DnfQuery {
             .any(|conj| conj.conditions().iter().any(|c| c.field_name() == name))
     }
 
-    /// Check if this query is always false (empty query with no conjunctions).
+    /// Returns `true` if the query has no conjunctions and so always evaluates to `false`.
     ///
-    /// An empty DNF query evaluates to false because there are no conjunctions
-    /// that could possibly match.
+    /// # Examples
     ///
-    /// # Example
+    /// ```
+    /// use dnf::DnfQuery;
     ///
-    /// ```rust
-    /// use dnf::{DnfQuery, Op};
-    ///
-    /// let empty = DnfQuery::default();
-    /// assert!(empty.is_always_false());
-    ///
-    /// let non_empty = DnfQuery::builder()
-    ///     .or(|c| c.and("x", Op::EQ, 1))
-    ///     .build();
-    /// assert!(!non_empty.is_always_false());
+    /// assert!(DnfQuery::builder().build().is_always_false());
     /// ```
     pub fn is_always_false(&self) -> bool {
         self.conjunctions.is_empty()
     }
 
-    /// Check if this query has an empty conjunction (always true).
+    /// Returns `true` if any conjunction is empty and so always evaluates to `true`.
     ///
-    /// A query with an empty conjunction (no conditions) always evaluates to true
-    /// because an empty conjunction is trivially satisfied.
+    /// The builder filters empty conjunctions, so a `true` result here only
+    /// happens for queries built via deserialization or internal APIs.
     ///
-    /// Note: The builder API filters out empty conjunctions, so this only occurs
-    /// with queries constructed via deserialization or internal APIs.
+    /// # Examples
     ///
-    /// # Example
-    ///
-    /// ```rust
+    /// ```
     /// use dnf::{DnfQuery, Op};
     ///
-    /// // Normal queries are not always true
-    /// let query = DnfQuery::builder()
-    ///     .or(|c| c.and("x", Op::EQ, 1))
-    ///     .build();
-    /// assert!(!query.is_always_true());
-    ///
-    /// // Empty queries (default) are not always true either
-    /// let empty = DnfQuery::default();
-    /// assert!(!empty.is_always_true());
+    /// let q = DnfQuery::builder().or(|c| c.and("age", Op::GT, 18)).build();
+    /// assert!(!q.is_always_true());
     /// ```
     pub fn is_always_true(&self) -> bool {
         self.conjunctions.iter().any(|c| c.is_empty())
     }
 
-    /// Validate that all field names in this query exist in the target type.
+    /// Validates field names and custom operators against type `T`.
     ///
-    /// Returns `Ok(self)` if all fields are valid, allowing method chaining.
-    /// Returns `Err` with the first unknown field name if validation fails.
+    /// # Errors
     ///
-    /// # Example
+    /// - [`DnfError::UnknownField`](crate::DnfError::UnknownField) for the first
+    ///   condition that references a field not declared by `T::fields()`.
+    /// - [`DnfError::UnregisteredCustomOp`](crate::DnfError::UnregisteredCustomOp)
+    ///   for the first condition using a custom operator that has not been
+    ///   registered.
+    /// - [`DnfError::InvalidMapTarget`](crate::DnfError::InvalidMapTarget) when a
+    ///   `@keys` / `@values` / `at_key` value is paired with a non-map field.
     ///
-    /// ```rust
+    /// # Examples
+    ///
+    /// ```
     /// use dnf::{DnfEvaluable, DnfQuery, Op};
     ///
     /// #[derive(DnfEvaluable)]
-    /// struct User {
-    ///     age: u32,
-    ///     name: String,
-    /// }
+    /// struct User { age: u32, name: String }
     ///
-    /// // Valid query
     /// let query = DnfQuery::builder()
     ///     .or(|c| c.and("age", Op::GT, 18))
     ///     .build()
-    ///     .validate::<User>()
-    ///     .unwrap();
-    ///
-    /// // Invalid query - unknown field
-    /// let result = DnfQuery::builder()
-    ///     .or(|c| c.and("unknown", Op::GT, 18))
-    ///     .build()
-    ///     .validate::<User>();
-    /// assert!(result.is_err());
+    ///     .validate::<User>()?;
+    /// # Ok::<(), dnf::DnfError>(())
     /// ```
     pub fn validate<T: crate::DnfEvaluable>(self) -> Result<Self, crate::DnfError> {
         use crate::FieldKind;
-        use std::collections::HashMap;
 
-        // First, validate custom operators are registered
         self.validate_custom_ops()?;
-
-        let field_info: HashMap<&str, FieldKind> = T::fields().map(|f| (f.name, f.kind)).collect();
 
         for conj in &self.conjunctions {
             for condition in conj.conditions() {
                 let field_name = condition.field_name();
                 let value = condition.value();
 
-                // Handle nested fields - check the root field
-                let root_field = field_name.split('.').next().unwrap_or(field_name);
+                let field_kind = T::validate_field_path(field_name).ok_or_else(|| {
+                    crate::DnfError::UnknownField {
+                        field_name: field_name.into(),
+                        position: None,
+                    }
+                })?;
 
-                let field_kind =
-                    field_info
-                        .get(root_field)
-                        .ok_or_else(|| crate::DnfError::UnknownField {
-                            field_name: field_name.into(),
-                            position: 0,
-                        })?;
-
-                // Validate map target values are only used with Map fields
-                let is_map_value = matches!(
-                    value,
-                    Value::AtKey(_, _) | Value::Keys(_) | Value::Values(_)
-                );
-
-                if is_map_value && *field_kind != FieldKind::Map {
+                if value.is_map_targeted() && field_kind != FieldKind::Map {
                     return Err(crate::DnfError::InvalidMapTarget {
                         field_name: field_name.into(),
-                        field_kind: *field_kind,
+                        field_kind,
                     });
                 }
             }
@@ -512,25 +509,18 @@ impl DnfQuery {
         Ok(self)
     }
 
-    /// Merge another query into this one (OR combination).
+    /// Merges another query into this one as an `OR` combination.
     ///
-    /// Combines conjunctions from both queries. The result matches if
-    /// either original query would match.
+    /// Custom-operator registries from `other` are merged in; on name collision,
+    /// `other` wins.
     ///
-    /// # Example
+    /// # Examples
     ///
-    /// ```rust
+    /// ```
     /// use dnf::{DnfQuery, Op};
     ///
-    /// let adults = DnfQuery::builder()
-    ///     .or(|c| c.and("age", Op::GTE, 18))
-    ///     .build();
-    ///
-    /// let premium = DnfQuery::builder()
-    ///     .or(|c| c.and("premium", Op::EQ, true))
-    ///     .build();
-    ///
-    /// // (age >= 18) OR (premium == true)
+    /// let adults = DnfQuery::builder().or(|c| c.and("age", Op::GTE, 18)).build();
+    /// let premium = DnfQuery::builder().or(|c| c.and("premium", Op::EQ, true)).build();
     /// let combined = adults.merge(premium);
     /// assert_eq!(combined.conjunctions().len(), 2);
     /// ```
@@ -538,10 +528,11 @@ impl DnfQuery {
     pub fn merge(mut self, other: Self) -> Self {
         let (conjunctions, custom_ops) = other.into_parts();
         self.conjunctions.extend(conjunctions);
-        // Merge custom ops if other has them
         if let Some(other_ops) = custom_ops {
             match &mut self.custom_ops {
-                Some(ops) => ops.merge(other_ops),
+                Some(ops) => {
+                    ops.merge(other_ops);
+                }
                 None => self.custom_ops = Some(other_ops),
             }
         }
@@ -1352,7 +1343,7 @@ mod tests {
 
     // ==================== Custom Operator Tests ====================
 
-    // Mock with get_field_value support
+    // Mock with field_value support
     struct MockWithFieldValue {
         age: i64,
         score: f64,
@@ -1370,7 +1361,7 @@ mod tests {
             }
         }
 
-        fn get_field_value(&self, field_name: &str) -> Option<Value> {
+        fn field_value(&self, field_name: &str) -> Option<Value> {
             match field_name {
                 "age" => Some(Value::Int(self.age)),
                 "score" => Some(Value::Float(self.score)),

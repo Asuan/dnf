@@ -1,37 +1,68 @@
 //! Field evaluation trait for DNF queries.
 //!
-//! The `DnfField` trait provides a unified interface for evaluating
-//! struct fields against query operators and values.
+//! The [`DnfField`] trait provides a unified interface for evaluating
+//! struct fields against query operators and values. Blanket impls cover
+//! the standard primitive, string, collection, and map types; user types
+//! either implement the trait directly or are picked up automatically by
+//! the `derive(DnfEvaluable)` macro.
 
 use crate::operator::Op;
 use crate::value::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-/// Trait for types that can be evaluated as a field value in DNF queries.
+/// Evaluates a struct field against a DNF operator and value.
 ///
-/// This trait is implemented for:
-/// - All primitive types (`i8`-`i64`, `u8`-`u64`, `f32`, `f64`, `bool`)
-/// - String types (`String`, `&str`, `Box<str>`, `Cow<str>`)
-/// - Collections (`Vec<T>`, `HashSet<T>`) where `T: PartialEq<Value> + PartialOrd<Value>`
-/// - Options (`Option<T>`) where `T: DnfField`
-/// - Maps (`HashMap<K, V>`, `BTreeMap<K, V>`) where `K: AsRef<str>` and `V: DnfField`
+/// Implemented for the standard primitive, string, collection, option, and
+/// map types. To support a custom type, implement this trait by delegating
+/// to an existing impl that matches the underlying representation.
 ///
-/// # Example: Custom Type
+/// # Implementations
 ///
-/// ```rust
+/// - All primitive numeric types: `i8`–`i64`, `isize`, `u8`–`u64`, `usize`,
+///   `f32`, `f64`, `bool`.
+/// - String types: [`String`], [`str`], [`Box<str>`],
+///   [`Cow<'_, str>`](std::borrow::Cow).
+/// - Collections: [`Vec<T>`] and [`HashSet<T>`](std::collections::HashSet)
+///   where `T: PartialEq<Value> + PartialOrd<Value>`.
+/// - [`Option<T>`] where `T: DnfField`. `None` matches only against
+///   [`Value::None`] with [`Op::EQ`]/[`Op::NE`]; all other operators on
+///   `None` evaluate to `false`.
+/// - Maps: [`HashMap<String, V>`](std::collections::HashMap) and
+///   [`BTreeMap<String, V>`](std::collections::BTreeMap) where
+///   `V: DnfField`, evaluated against [`Value::AtKey`], [`Value::Keys`], or
+///   [`Value::Values`].
+///
+/// # Examples
+///
+/// ```
 /// use dnf::{DnfField, Op, Value};
 ///
 /// struct Score(u32);
 ///
 /// impl DnfField for Score {
 ///     fn evaluate(&self, op: &Op, value: &Value) -> bool {
-///         // Delegate to the i64 implementation
 ///         (self.0 as i64).evaluate(op, value)
 ///     }
 /// }
+///
+/// assert!(Score(42).evaluate(&Op::GT, &Value::Int(10)));
+/// assert!(!Score(5).evaluate(&Op::GT, &Value::Int(10)));
 /// ```
 pub trait DnfField {
-    /// Evaluate this field against an operator and value.
+    /// Evaluates this field against `op` and `value`.
+    ///
+    /// Returns `true` if the field satisfies the predicate. Type
+    /// mismatches and operators that are not meaningful for the field's
+    /// type return `false` rather than producing an error.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use dnf::{DnfField, Op, Value};
+    ///
+    /// assert!(42i64.evaluate(&Op::GT, &Value::Int(10)));
+    /// assert!("hello".evaluate(&Op::CONTAINS, &Value::from("ell")));
+    /// ```
     fn evaluate(&self, op: &Op, value: &Value) -> bool;
 }
 
@@ -142,8 +173,6 @@ where
 }
 
 // ==================== Option<T> ====================
-
-// TODO: add Arc<T> support
 
 impl<T> DnfField for Option<T>
 where

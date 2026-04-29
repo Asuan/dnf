@@ -44,16 +44,18 @@ let query = DnfQuery::builder()
 Or use the parser — it validates automatically:
 
 ```rust
-let query = DnfQuery::parse::<User>("age > 18")?;
+use dnf::QueryBuilder;
+
+let query = QueryBuilder::from_query::<User>("age > 18")?;
 ```
 
 ## Features
 
 ```toml
 [dependencies]
-dnf = "0.1"                                       # derive only
-dnf = { version = "0.1", features = ["serde"] }   # + serialization
-dnf = { version = "0.1", features = ["parser"] }  # + string parsing
+dnf = "0.2"                                       # derive only
+dnf = { version = "0.2", features = ["serde"] }   # + serialization
+dnf = { version = "0.2", features = ["parser"] }  # + string parsing
 ```
 
 | Feature | What it does |
@@ -61,6 +63,8 @@ dnf = { version = "0.1", features = ["parser"] }  # + string parsing
 | `derive` | `#[derive(DnfEvaluable)]` macro (default) |
 | `serde` | Serialization support |
 | `parser` | Parse queries from strings |
+
+Minimum supported Rust version: **1.80**.
 
 ## Supported Types
 
@@ -81,9 +85,11 @@ dnf = { version = "0.1", features = ["parser"] }  # + string parsing
 |----------|-----------|
 | Comparison | `==` `!=` `>` `<` `>=` `<=` |
 | String | `CONTAINS` `STARTS WITH` `ENDS WITH` (+ NOT variants) |
-| Collection | `ANY OF` `ALL OF` (+ NOT variants) |
+| Collection | `IN` `ALL OF` (+ NOT variants) |
 | Range | `BETWEEN [min, max]` |
 | Custom | `Op::custom("NAME")` |
+
+The builder uses `Op::ANY_OF` / `Op::NOT_ANY_OF`; in query strings these are written `IN` / `NOT IN`.
 
 ## Collections & Range
 
@@ -115,6 +121,29 @@ struct User {
 // Query: "address.city" or "offices.city"
 ```
 
+## Map Fields
+
+`HashMap` / `BTreeMap` fields use map-target wrappers on the value side:
+
+```rust
+#[derive(DnfEvaluable)]
+struct Document { tags: HashMap<String, String> }
+
+let q = DnfQuery::builder()
+    .or(|c| c.and("tags", Op::CONTAINS, Value::keys("author")))      // has key "author"
+    .or(|c| c.and("tags", Op::EQ, Value::at_key("status", "live")))  // tags["status"] == "live"
+    .build();
+```
+
+Constructors: `Value::at_key(k, v)`, `Value::keys(v)`, `Value::values(v)`.
+
+## Custom Field Types
+
+The derive only handles built-in types. For wrappers like `struct Score(u32)`:
+
+1. `impl From<&Score> for Value`
+2. Manually `impl DnfEvaluable` (or use `#[dnf(nested)]` if `Score` already implements it)
+
 ## Custom Operators
 
 ```rust
@@ -135,7 +164,9 @@ let q = DnfQuery::builder()
 
 ## Examples
 
-See dnf/examples/*
+Runnable examples covering derive, parser, custom operators, collections,
+serialization, and `HashMap` fields live in the [`dnf/examples/`](https://github.com/Asuan/dnf/tree/master/dnf/examples)
+directory of the repository.
 
 ## License
 

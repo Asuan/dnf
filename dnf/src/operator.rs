@@ -1,29 +1,89 @@
 use crate::Value;
 use std::fmt;
 
+/// Direction of an ordered comparison.
+///
+/// Combined with [`Op::is_inverse`] to form the four ordering operators:
+/// `Greater` + `false` = `>`, `Greater` + `true` = `<=`, `Less` + `false` =
+/// `<`, `Less` + `true` = `>=`.
+///
+/// # Examples
+///
+/// ```
+/// use dnf::{ComparisonOrdering, Op};
+/// use dnf::BaseOperator;
+///
+/// assert_eq!(Op::GT.base(), &BaseOperator::Comparison(ComparisonOrdering::Greater));
+/// assert_eq!(Op::LT.base(), &BaseOperator::Comparison(ComparisonOrdering::Less));
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ComparisonOrdering {
-    Greater, // > when inverse=false, <= when inverse=true
-    Less,    // < when inverse=false, >= when inverse=true
+    /// `>` when not inverse, `<=` when inverse.
+    Greater,
+    /// `<` when not inverse, `>=` when inverse.
+    Less,
 }
 
+/// Underlying operator without negation.
+///
+/// Pair with [`Op::is_inverse`] to recover the surface-level operator name
+/// (`CONTAINS` vs `NOT CONTAINS`, etc.). Use [`Op::base`] to extract from an
+/// existing [`Op`].
+///
+/// This enum is `#[non_exhaustive]`: new variants may be added in future
+/// versions without a major bump.
+///
+/// # Examples
+///
+/// ```
+/// use dnf::{BaseOperator, Op};
+///
+/// assert_eq!(Op::EQ.base(), &BaseOperator::Eq);
+/// assert_eq!(Op::NE.base(), &BaseOperator::Eq);
+/// assert!(Op::NE.is_inverse());
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub enum BaseOperator {
+    /// Equality (`==`, or `!=` when inverse).
     Eq,
+    /// Ordered comparison along the given direction.
     Comparison(ComparisonOrdering),
+    /// Substring containment for strings.
     Contains,
+    /// Prefix match for strings.
     StartsWith,
+    /// Suffix match for strings.
     EndsWith,
+    /// Collection contains every required value.
     AllOf,
+    /// Collection contains any required value.
     AnyOf,
+    /// Inclusive range check `[min, max]`.
     Between,
+    /// User-supplied operator resolved via [`OpRegistry`](crate::OpRegistry).
     Custom(Box<str>),
 }
 
-/// Operators with inverse flag for negations (e.g., NOT CONTAINS).
+/// A query operator with an optional negation flag.
+///
+/// Pairs a [`BaseOperator`] with an `inverse` bit so that negations like
+/// `NOT CONTAINS` and `!=` share their evaluation logic with their
+/// non-negated counterpart. Construct via the associated constants
+/// ([`Op::EQ`], [`Op::GT`], etc.) or [`Op::custom`] for a registered
+/// operator.
+///
+/// # Examples
+///
+/// ```
+/// use dnf::Op;
+///
+/// assert!(!Op::EQ.is_inverse());
+/// assert!(Op::NE.is_inverse());
+/// assert_eq!(Op::EQ.base(), Op::NE.base());
+/// ```
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Op {
@@ -32,98 +92,102 @@ pub struct Op {
 }
 
 impl Op {
-    /// `==`
+    /// The equality operator (`==`).
     pub const EQ: Self = Self {
         base: BaseOperator::Eq,
         inverse: false,
     };
-    /// `!=`
+    /// The inequality operator (`!=`).
     pub const NE: Self = Self {
         base: BaseOperator::Eq,
         inverse: true,
     };
-    /// `>`
+    /// The greater-than operator (`>`).
     pub const GT: Self = Self {
         base: BaseOperator::Comparison(ComparisonOrdering::Greater),
         inverse: false,
     };
-    /// `<=`
+    /// The less-than-or-equal operator (`<=`).
     pub const LTE: Self = Self {
         base: BaseOperator::Comparison(ComparisonOrdering::Greater),
         inverse: true,
     };
-    /// `<`
+    /// The less-than operator (`<`).
     pub const LT: Self = Self {
         base: BaseOperator::Comparison(ComparisonOrdering::Less),
         inverse: false,
     };
-    /// `>=`
+    /// The greater-than-or-equal operator (`>=`).
     pub const GTE: Self = Self {
         base: BaseOperator::Comparison(ComparisonOrdering::Less),
         inverse: true,
     };
-    /// `CONTAINS`
+    /// Substring containment for strings (`CONTAINS`).
     pub const CONTAINS: Self = Self {
         base: BaseOperator::Contains,
         inverse: false,
     };
-    /// `NOT CONTAINS`
+    /// Negated [`CONTAINS`](Self::CONTAINS) (`NOT CONTAINS`).
     pub const NOT_CONTAINS: Self = Self {
         base: BaseOperator::Contains,
         inverse: true,
     };
-    /// `STARTS WITH`
+    /// Prefix match for strings (`STARTS WITH`).
     pub const STARTS_WITH: Self = Self {
         base: BaseOperator::StartsWith,
         inverse: false,
     };
-    /// `NOT STARTS WITH`
+    /// Negated [`STARTS_WITH`](Self::STARTS_WITH) (`NOT STARTS WITH`).
     pub const NOT_STARTS_WITH: Self = Self {
         base: BaseOperator::StartsWith,
         inverse: true,
     };
-    /// `ENDS WITH`
+    /// Suffix match for strings (`ENDS WITH`).
     pub const ENDS_WITH: Self = Self {
         base: BaseOperator::EndsWith,
         inverse: false,
     };
-    /// `NOT ENDS WITH`
+    /// Negated [`ENDS_WITH`](Self::ENDS_WITH) (`NOT ENDS WITH`).
     pub const NOT_ENDS_WITH: Self = Self {
         base: BaseOperator::EndsWith,
         inverse: true,
     };
-    /// `ALL OF`
+    /// Subset check: every required value is present in the field (`ALL OF`).
     pub const ALL_OF: Self = Self {
         base: BaseOperator::AllOf,
         inverse: false,
     };
-    /// `NOT ALL OF`
+    /// Negated [`ALL_OF`](Self::ALL_OF) (`NOT ALL OF`).
     pub const NOT_ALL_OF: Self = Self {
         base: BaseOperator::AllOf,
         inverse: true,
     };
-    /// `IN [...], ANY OF [...]`
+    /// Membership check: the field contains at least one of the values (`ANY OF`, `IN`).
     pub const ANY_OF: Self = Self {
         base: BaseOperator::AnyOf,
         inverse: false,
     };
-    /// `NOT IN [...], NOT ANY OF [...]`
+    /// Negated [`ANY_OF`](Self::ANY_OF) (`NOT ANY OF`, `NOT IN`).
     pub const NOT_ANY_OF: Self = Self {
         base: BaseOperator::AnyOf,
         inverse: true,
     };
-    /// `BETWEEN [min, max]` (inclusive)
+    /// Inclusive range check (`BETWEEN [min, max]`).
     pub const BETWEEN: Self = Self {
         base: BaseOperator::Between,
         inverse: false,
     };
-    /// `NOT BETWEEN [min, max]`
+    /// Negated [`BETWEEN`](Self::BETWEEN) (`NOT BETWEEN [min, max]`).
     pub const NOT_BETWEEN: Self = Self {
         base: BaseOperator::Between,
         inverse: true,
     };
 
-    /// Custom operator by name (requires OpRegistry)
+    /// Constructs a custom operator referenced by `name`.
+    ///
+    /// The operator must be registered on the query's
+    /// [`OpRegistry`](crate::OpRegistry) before evaluation; an unregistered
+    /// custom operator evaluates to `false`.
     pub fn custom(name: impl Into<Box<str>>) -> Self {
         Self {
             base: BaseOperator::Custom(name.into()),
@@ -131,6 +195,10 @@ impl Op {
         }
     }
 
+    /// Constructs the negated form of a custom operator.
+    ///
+    /// Equivalent to [`custom`](Self::custom) with the inverse flag set; the
+    /// result of the registered evaluator is negated.
     pub fn not_custom(name: impl Into<Box<str>>) -> Self {
         Self {
             base: BaseOperator::Custom(name.into()),
@@ -138,6 +206,7 @@ impl Op {
         }
     }
 
+    /// Returns the custom operator's name, or [`None`] for built-in operators.
     pub fn custom_name(&self) -> Option<&str> {
         match &self.base {
             BaseOperator::Custom(name) => Some(name),
@@ -145,16 +214,30 @@ impl Op {
         }
     }
 
+    /// Returns `true` if this is a custom operator.
     pub fn is_custom(&self) -> bool {
         matches!(self.base, BaseOperator::Custom(_))
     }
 
-    /// Get the base operator type.
+    /// Returns the underlying [`BaseOperator`].
+    ///
+    /// The base operator strips the negation flag; for example, both
+    /// [`Op::EQ`] and [`Op::NE`] return [`BaseOperator::Eq`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use dnf::{BaseOperator, Op};
+    ///
+    /// assert_eq!(Op::EQ.base(), &BaseOperator::Eq);
+    /// assert_eq!(Op::NE.base(), &BaseOperator::Eq);
+    /// ```
     pub fn base(&self) -> &BaseOperator {
         &self.base
     }
 
-    /// Check if the operator result is inverted.
+    /// Returns `true` if the operator is the negated form (e.g.
+    /// [`Op::NE`], [`Op::NOT_CONTAINS`]).
     pub fn is_inverse(&self) -> bool {
         self.inverse
     }
@@ -381,18 +464,26 @@ impl Op {
         }
     }
 
-    /// Apply operator to an iterator of field values.
+    /// Applies the operator to an iterator of field values.
     ///
-    /// # Type Constraints
+    /// Used by [`DnfField`](crate::DnfField) implementations for collection
+    /// fields (such as `Vec<T>` and `HashSet<T>`); the iterator yields
+    /// references to the contained items, which must be directly comparable
+    /// against [`Value`] without allocating an intermediate
+    /// [`Value`] wrapper.
     ///
-    /// - `T`: The item type that implements `PartialEq<Value> + PartialOrd<Value>` for direct comparison
-    /// - Direct comparison avoids intermediate `Value` allocation (especially for strings)
+    /// `BETWEEN` returns `false` for collections (it is a scalar operator).
+    /// Custom operators are not applied here — they are dispatched at the
+    /// [`DnfQuery`](crate::DnfQuery) level via the registry.
     ///
     /// # Examples
     ///
-    /// ```ignore
-    /// // In derive macro:
-    /// "tags" => operator.any(self.tags.iter(), value)
+    /// ```
+    /// use dnf::{Op, Value};
+    ///
+    /// let tags = ["rust", "queries", "dnf"];
+    /// assert!(Op::ANY_OF.any(tags.iter(), &Value::from(vec!["rust", "go"])));
+    /// assert!(!Op::ANY_OF.any(tags.iter(), &Value::from(vec!["python", "java"])));
     /// ```
     pub fn any<'a, I, T>(&self, mut field_iter: I, query_value: &Value) -> bool
     where

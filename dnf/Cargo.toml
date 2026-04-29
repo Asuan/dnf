@@ -19,8 +19,9 @@ all-features = true
 targets = []
 
 [dependencies]
-dnf-derive = { version = "0.1.0", path = "../dnf-derive", optional = true }
+dnf-derive = { version = "0.2.0", path = "../dnf-derive", optional = true }
 serde = { version = "1.0", features = ["derive"], optional = true }
+thiserror = "2.0.18"
 
 [features]
 default = ["derive"]

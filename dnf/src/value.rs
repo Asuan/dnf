@@ -70,17 +70,45 @@ impl PartialOrd<Value> for bool {
     }
 }
 
-/// Represents a value that can be used in DNF query conditions.
+/// A value used in a DNF query condition.
 ///
-/// Supports common data types for comparisons.
-/// Uses `Box<str>` for internal string storage - queries are typically built once and evaluated many times.
-/// Accepts `String`, `&str`, `Box<str>`, and `Cow<str>` via `From` trait implementations.
+/// Stores the right-hand side of every condition, including scalars,
+/// collections (arrays and sets), and map-target wrappers ([`AtKey`],
+/// [`Keys`], [`Values`]) that encode field access on
+/// [`HashMap`](std::collections::HashMap) /
+/// [`BTreeMap`](std::collections::BTreeMap) fields.
+///
+/// Strings use [`Box<str>`] internally because queries are typically built
+/// once and evaluated many times. Use the [`From`] impls (or the `set_*`
+/// constructors below) to build values without naming the variants
+/// directly.
+///
+/// This enum is `#[non_exhaustive]`: new variants may be added in future
+/// versions without a major bump.
+///
+/// [`AtKey`]: Self::AtKey
+/// [`Keys`]: Self::Keys
+/// [`Values`]: Self::Values
+///
+/// # Examples
+///
+/// ```
+/// use dnf::Value;
+///
+/// let s: Value = "hello".into();
+/// let n: Value = 42i64.into();
+/// let v: Value = vec![1u64, 2, 3].into();
+///
+/// assert!(matches!(s, Value::String(_)));
+/// assert!(matches!(n, Value::Int(42)));
+/// assert!(matches!(v, Value::UintArray(_)));
+/// ```
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(tag = "type", content = "value"))]
 #[non_exhaustive]
 pub enum Value {
-    /// String value
+    /// A UTF-8 string.
     #[cfg_attr(
         feature = "serde",
         serde(
@@ -89,17 +117,17 @@ pub enum Value {
         )
     )]
     String(Box<str>),
-    /// Signed integer value
+    /// A signed 64-bit integer.
     Int(i64),
-    /// Unsigned integer value
+    /// An unsigned 64-bit integer.
     Uint(u64),
-    /// Floating point value
+    /// A 64-bit floating-point number.
     Float(f64),
-    /// Boolean value
+    /// A boolean.
     Bool(bool),
-    /// Null/None value
+    /// The absence of a value (null).
     None,
-    /// Array of strings
+    /// An ordered array of strings.
     #[cfg_attr(
         feature = "serde",
         serde(
@@ -108,7 +136,7 @@ pub enum Value {
         )
     )]
     StringArray(Box<[Box<str>]>),
-    /// Array of signed integers
+    /// An ordered array of signed integers.
     #[cfg_attr(
         feature = "serde",
         serde(
@@ -117,7 +145,7 @@ pub enum Value {
         )
     )]
     IntArray(Box<[i64]>),
-    /// Array of unsigned integers
+    /// An ordered array of unsigned integers.
     #[cfg_attr(
         feature = "serde",
         serde(
@@ -126,7 +154,7 @@ pub enum Value {
         )
     )]
     UintArray(Box<[u64]>),
-    /// Array of floats
+    /// An ordered array of floats.
     #[cfg_attr(
         feature = "serde",
         serde(
@@ -135,7 +163,7 @@ pub enum Value {
         )
     )]
     FloatArray(Box<[f64]>),
-    /// Array of booleans
+    /// An ordered array of booleans.
     #[cfg_attr(
         feature = "serde",
         serde(
@@ -144,7 +172,8 @@ pub enum Value {
         )
     )]
     BoolArray(Box<[bool]>),
-    /// Set of strings - preserves set semantics
+    /// A set of strings (faster `ALL OF` / `ANY OF` lookups than
+    /// [`StringArray`](Self::StringArray)).
     #[cfg_attr(
         feature = "serde",
         serde(
@@ -153,7 +182,7 @@ pub enum Value {
         )
     )]
     StringSet(Box<HashSet<Box<str>>>),
-    /// Set of signed integers - preserves set semantics
+    /// A set of signed integers.
     #[cfg_attr(
         feature = "serde",
         serde(
@@ -162,7 +191,7 @@ pub enum Value {
         )
     )]
     IntSet(Box<HashSet<i64>>),
-    /// Set of unsigned integers - preserves set semantics
+    /// A set of unsigned integers.
     #[cfg_attr(
         feature = "serde",
         serde(
@@ -171,7 +200,7 @@ pub enum Value {
         )
     )]
     UintSet(Box<HashSet<u64>>),
-    /// Set of booleans - preserves set semantics
+    /// A set of booleans.
     #[cfg_attr(
         feature = "serde",
         serde(
@@ -181,12 +210,10 @@ pub enum Value {
     )]
     BoolSet(Box<HashSet<bool>>),
 
-    // ==================== Map Target Wrappers ====================
-    //
-    // These variants encode the target (key access, keys, values)
-    // along with the comparison value for HashMap/BTreeMap field operations.
-    /// Access value at specific key: `metadata["author"] == "Alice"`
-    /// Contains (key, value_to_compare)
+    /// Map-targeted access at a specific key (`metadata["author"] == "Alice"`).
+    ///
+    /// The first field is the map key; the second is the value to compare
+    /// against the entry stored at that key.
     #[cfg_attr(
         feature = "serde",
         serde(
@@ -196,68 +223,88 @@ pub enum Value {
     )]
     AtKey(Box<str>, Box<Value>),
 
-    /// Match against map keys: `metadata.@keys CONTAINS "author"`
-    /// Contains the value to compare against keys
+    /// Map-targeted access against the set of keys
+    /// (`metadata.@keys CONTAINS "author"`).
     Keys(Box<Value>),
 
-    /// Match against map values: `metadata.@values ANY OF ["v1", "v2"]`
-    /// Contains the value to compare against values
+    /// Map-targeted access against the set of values
+    /// (`metadata.@values ANY OF ["v1", "v2"]`).
     Values(Box<Value>),
 }
 
 impl Value {
     // ==================== Map Target Constructors ====================
 
-    /// Create an AtKey wrapper for accessing a specific map key.
+    /// Constructs an [`AtKey`](Self::AtKey) value addressing a specific map key.
     ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use dnf::Value;
-    ///
-    /// // Query: metadata["author"] == "Alice"
-    /// let v = Value::at_key("author", "Alice");
-    /// ```
+    /// Use this on map-typed fields to compare the entry at `key` against
+    /// `value`.
     pub fn at_key(key: impl Into<Box<str>>, value: impl Into<Value>) -> Self {
         Value::AtKey(key.into(), Box::new(value.into()))
     }
 
-    /// Create a Keys wrapper for matching against map keys.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use dnf::Value;
-    ///
-    /// // Query: metadata.@keys CONTAINS "author"
-    /// let v = Value::keys("author");
-    /// ```
+    /// Constructs a [`Keys`](Self::Keys) value matching against map keys.
     pub fn keys(value: impl Into<Value>) -> Self {
         Value::Keys(Box::new(value.into()))
     }
 
-    /// Create a Values wrapper for matching against map values.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use dnf::Value;
-    ///
-    /// // Query: metadata.@values ANY OF ["v1", "v2"]
-    /// let v = Value::values(vec!["v1", "v2"]);
-    /// ```
+    /// Constructs a [`Values`](Self::Values) value matching against map values.
     pub fn values(value: impl Into<Value>) -> Self {
         Value::Values(Box::new(value.into()))
     }
 
-    // ==================== Set Constructors ====================
-    //
-    // Use these for ALL OF / ANY OF operations to get O(1) lookup performance.
-    // Arrays use O(n) linear search, Sets use O(1) HashSet lookup.
-
-    /// Create a StringSet for efficient ALL OF / ANY OF operations.
+    /// Returns `true` if `self` is a map-targeted value.
     ///
-    /// Uses HashSet for O(1) lookup instead of O(n) array search.
+    /// Map-targeted values ([`AtKey`](Self::AtKey), [`Keys`](Self::Keys),
+    /// [`Values`](Self::Values)) are only meaningful on map-typed fields and
+    /// are rejected by query validation when applied to scalar or iterable
+    /// fields.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use dnf::Value;
+    ///
+    /// assert!(Value::at_key("k", 1).is_map_targeted());
+    /// assert!(Value::keys("k").is_map_targeted());
+    /// assert!(!Value::Int(42).is_map_targeted());
+    /// ```
+    pub fn is_map_targeted(&self) -> bool {
+        match self {
+            Value::AtKey(_, _) | Value::Keys(_) | Value::Values(_) => true,
+            Value::String(_)
+            | Value::Int(_)
+            | Value::Uint(_)
+            | Value::Float(_)
+            | Value::Bool(_)
+            | Value::None
+            | Value::StringArray(_)
+            | Value::IntArray(_)
+            | Value::UintArray(_)
+            | Value::FloatArray(_)
+            | Value::BoolArray(_)
+            | Value::StringSet(_)
+            | Value::IntSet(_)
+            | Value::UintSet(_)
+            | Value::BoolSet(_) => false,
+        }
+    }
+
+    /// Constructs a [`StringSet`](Self::StringSet) from any iterable of
+    /// string-like values.
+    ///
+    /// Sets are preferred over [`StringArray`](Self::StringArray) for
+    /// `ALL OF` / `ANY OF` operations because they offer O(1) membership
+    /// lookup instead of O(n) linear search.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use dnf::Value;
+    ///
+    /// let v = Value::string_set(["a", "b", "c"]);
+    /// assert!(matches!(v, Value::StringSet(_)));
+    /// ```
     pub fn string_set<I, S>(values: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -267,9 +314,19 @@ impl Value {
         Value::StringSet(Box::new(set))
     }
 
-    /// Create an IntSet for efficient ALL OF / ANY OF operations.
+    /// Constructs an [`IntSet`](Self::IntSet) from any iterable of [`i64`].
     ///
-    /// Uses HashSet for O(1) lookup instead of O(n) array search.
+    /// See [`string_set`](Self::string_set) for the rationale of using a set
+    /// over [`IntArray`](Self::IntArray).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use dnf::Value;
+    ///
+    /// let v = Value::int_set([1, 2, 3]);
+    /// assert!(matches!(v, Value::IntSet(_)));
+    /// ```
     pub fn int_set<I>(values: I) -> Self
     where
         I: IntoIterator<Item = i64>,
@@ -278,9 +335,19 @@ impl Value {
         Value::IntSet(Box::new(set))
     }
 
-    /// Create a UintSet for efficient ALL OF / ANY OF operations.
+    /// Constructs a [`UintSet`](Self::UintSet) from any iterable of [`u64`].
     ///
-    /// Uses HashSet for O(1) lookup instead of O(n) array search.
+    /// See [`string_set`](Self::string_set) for the rationale of using a set
+    /// over [`UintArray`](Self::UintArray).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use dnf::Value;
+    ///
+    /// let v = Value::uint_set([1u64, 2, 3]);
+    /// assert!(matches!(v, Value::UintSet(_)));
+    /// ```
     pub fn uint_set<I>(values: I) -> Self
     where
         I: IntoIterator<Item = u64>,
@@ -289,9 +356,19 @@ impl Value {
         Value::UintSet(Box::new(set))
     }
 
-    /// Create a BoolSet for efficient ALL OF / ANY OF operations.
+    /// Constructs a [`BoolSet`](Self::BoolSet) from any iterable of [`bool`].
     ///
-    /// Uses HashSet for O(1) lookup instead of O(n) array search.
+    /// See [`string_set`](Self::string_set) for the rationale of using a set
+    /// over [`BoolArray`](Self::BoolArray).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use dnf::Value;
+    ///
+    /// let v = Value::bool_set([true, false]);
+    /// assert!(matches!(v, Value::BoolSet(_)));
+    /// ```
     pub fn bool_set<I>(values: I) -> Self
     where
         I: IntoIterator<Item = bool>,
@@ -1121,6 +1198,12 @@ impl From<&String> for Value {
 impl From<&Cow<'_, str>> for Value {
     fn from(val: &Cow<'_, str>) -> Self {
         Value::String(Box::from(val.as_ref()))
+    }
+}
+
+impl From<&Box<str>> for Value {
+    fn from(val: &Box<str>) -> Self {
+        Value::String(val.clone())
     }
 }
 
@@ -2064,8 +2147,6 @@ mod tests {
         assert!(true == val_true);
         assert!(false != val_true);
         assert!(false == val_false);
-        assert!(true == val_true);
-        assert!(false == val_false);
 
         // String "true"/"false" comparisons
         assert!(true == Value::from("true"));
@@ -2127,10 +2208,6 @@ mod tests {
         assert!("zebra" > val);
         assert!("hello" <= val);
         assert!("hello" >= val);
-
-        // Same tests (duplicated for clarity)
-        assert!("zebra" > val);
-        assert!("apple" < val);
     }
 
     // ==================== Cow<str> Tests ====================

@@ -237,18 +237,23 @@ fn test_fields_method() {
     assert_eq!(fields.len(), 4);
 
     // Check field names
-    let field_names: Vec<&str> = fields.iter().map(|f| f.name).collect();
-    assert!(field_names.contains(&"age"));
-    assert!(field_names.contains(&"name"));
-    assert!(field_names.contains(&"active"));
-    assert!(field_names.contains(&"score"));
+    let field_names: Vec<&str> = fields.iter().map(|f| f.name()).collect();
+    let expected_fields = [
+        ("age", true, "age field present"),
+        ("name", true, "name field present"),
+        ("active", true, "active field present"),
+        ("score", true, "score field present"),
+    ];
+    for (field, present, desc) in expected_fields {
+        assert_eq!(field_names.contains(&field), present, "User: {}", desc);
+    }
 
     // Check field types
-    let age_field = fields.iter().find(|f| f.name == "age").unwrap();
-    assert_eq!(age_field.field_type, "u32");
+    let age_field = fields.iter().find(|f| f.name() == "age").unwrap();
+    assert_eq!(age_field.field_type(), "u32");
 
-    let name_field = fields.iter().find(|f| f.name == "name").unwrap();
-    assert_eq!(name_field.field_type, "String");
+    let name_field = fields.iter().find(|f| f.name() == "name").unwrap();
+    assert_eq!(name_field.field_type(), "String");
 }
 
 #[test]
@@ -259,12 +264,17 @@ fn test_fields_with_attributes() {
     assert_eq!(fields.len(), 3);
 
     // Check that renamed field uses new name
-    let field_names: Vec<&str> = fields.iter().map(|f| f.name).collect();
-    assert!(field_names.contains(&"product_id"));
-    assert!(field_names.contains(&"name"));
-    assert!(field_names.contains(&"price"));
-    assert!(!field_names.contains(&"id")); // Original name should not be present
-    assert!(!field_names.contains(&"internal_code")); // Skipped field should not be present
+    let field_names: Vec<&str> = fields.iter().map(|f| f.name()).collect();
+    let expected_fields = [
+        ("product_id", true, "renamed field uses new name"),
+        ("name", true, "name field present"),
+        ("price", true, "price field present"),
+        ("id", false, "original pre-rename name absent"),
+        ("internal_code", false, "skipped field absent"),
+    ];
+    for (field, present, desc) in expected_fields {
+        assert_eq!(field_names.contains(&field), present, "Product: {}", desc);
+    }
 }
 
 // ==================== Nested Field Support Tests ====================
@@ -1484,11 +1494,11 @@ fn test_dnf_iter_field_kind() {
     // Verify that fields with #[dnf(iter)] are reported as Iter kind
     let fields: Vec<_> = DocumentWithLinkedList::fields().collect();
 
-    let tags_field = fields.iter().find(|f| f.name == "tags").unwrap();
-    assert_eq!(tags_field.kind, dnf::FieldKind::Iter);
+    let tags_field = fields.iter().find(|f| f.name() == "tags").unwrap();
+    assert_eq!(tags_field.kind(), dnf::FieldKind::Iter);
 
-    let scores_field = fields.iter().find(|f| f.name == "scores").unwrap();
-    assert_eq!(scores_field.kind, dnf::FieldKind::Iter);
+    let scores_field = fields.iter().find(|f| f.name() == "scores").unwrap();
+    assert_eq!(scores_field.kind(), dnf::FieldKind::Iter);
 }
 
 // ==================== Nested Collections Tests ====================
@@ -1954,6 +1964,81 @@ fn test_optional_cow_str_field() {
     assert!(test_field_condition(
         &doc_none,
         "title",
+        Op::EQ,
+        Value::None
+    ));
+}
+
+// ==================== Box<str> Tests ====================
+
+#[derive(DnfEvaluable)]
+struct DocWithBoxStr {
+    title: Box<str>,
+    tag: Box<str>,
+    nickname: Option<Box<str>>,
+}
+
+#[test]
+fn test_box_str_field() {
+    let doc = DocWithBoxStr {
+        title: "Hello".into(),
+        tag: "rust".into(),
+        nickname: Some("rusty".into()),
+    };
+
+    let test_cases = vec![
+        ("title", Op::EQ, Value::from("Hello"), true, "equals"),
+        ("title", Op::NE, Value::from("World"), true, "not equals"),
+        ("title", Op::CONTAINS, Value::from("ell"), true, "contains"),
+        (
+            "title",
+            Op::STARTS_WITH,
+            Value::from("Hel"),
+            true,
+            "starts with",
+        ),
+        ("title", Op::ENDS_WITH, Value::from("lo"), true, "ends with"),
+        (
+            "tag",
+            Op::EQ,
+            Value::from("rust"),
+            true,
+            "second field equals",
+        ),
+        (
+            "nickname",
+            Op::EQ,
+            Value::from("rusty"),
+            true,
+            "Some<Box<str>> equals",
+        ),
+        (
+            "nickname",
+            Op::CONTAINS,
+            Value::from("ust"),
+            true,
+            "Some<Box<str>> contains",
+        ),
+    ];
+
+    for (field, op, value, expected, desc) in test_cases {
+        assert_eq!(
+            test_field_condition(&doc, field, op, value),
+            expected,
+            "Failed: {}",
+            desc
+        );
+    }
+
+    // Option<Box<str>>: None compares equal to Value::None.
+    let doc_none = DocWithBoxStr {
+        title: "x".into(),
+        tag: "y".into(),
+        nickname: None,
+    };
+    assert!(test_field_condition(
+        &doc_none,
+        "nickname",
         Op::EQ,
         Value::None
     ));
