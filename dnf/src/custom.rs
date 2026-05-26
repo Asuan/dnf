@@ -22,7 +22,7 @@
 //! ```
 
 use crate::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// A reference-counted custom operator evaluation function.
@@ -31,6 +31,12 @@ use std::sync::Arc;
 /// when the condition matches. Wrapped in [`Arc`] so registries can be
 /// cloned cheaply across queries and threads.
 pub type CustomOpFn = Arc<dyn Fn(&Value, &Value) -> bool + Send + Sync>;
+
+#[derive(Clone)]
+struct RegisteredOp {
+    f: CustomOpFn,
+    novalue: bool,
+}
 
 /// A thread-safe registry of custom operators.
 ///
@@ -52,8 +58,7 @@ pub type CustomOpFn = Arc<dyn Fn(&Value, &Value) -> bool + Send + Sync>;
 /// ```
 #[derive(Clone, Default)]
 pub struct OpRegistry {
-    ops: HashMap<Box<str>, CustomOpFn>,
-    novalue_ops: HashSet<Box<str>>,
+    ops: HashMap<Box<str>, RegisteredOp>,
 }
 
 impl OpRegistry {
@@ -97,13 +102,13 @@ impl OpRegistry {
     where
         F: Fn(&Value, &Value) -> bool + Send + Sync + 'static,
     {
-        let name = name.into();
-        if novalue {
-            self.novalue_ops.insert(name.clone());
-        } else {
-            self.novalue_ops.remove(&name);
-        }
-        self.ops.insert(name, Arc::new(f));
+        self.ops.insert(
+            name.into(),
+            RegisteredOp {
+                f: Arc::new(f),
+                novalue,
+            },
+        );
         self
     }
 
@@ -127,7 +132,9 @@ impl OpRegistry {
     /// assert_eq!(registry.evaluate("UNKNOWN", &Value::Int(0), &Value::None), None);
     /// ```
     pub fn evaluate(&self, name: &str, field_value: &Value, query_value: &Value) -> Option<bool> {
-        self.ops.get(name).map(|f| f(field_value, query_value))
+        self.ops
+            .get(name)
+            .map(|op| (op.f)(field_value, query_value))
     }
 
     /// Returns `true` if an operator with the given `name` is registered.
@@ -168,14 +175,20 @@ impl OpRegistry {
 
     /// Returns `true` if the operator was registered with `novalue = true`.
     pub fn is_novalue(&self, name: &str) -> bool {
-        self.novalue_ops.contains(name)
+        self.ops.get(name).is_some_and(|op| op.novalue)
     }
 
     /// Returns an iterator over the names of all novalue operators.
     ///
     /// The order is unspecified.
     pub fn novalue_ops(&self) -> impl Iterator<Item = &str> {
-        self.novalue_ops.iter().map(|s| s.as_ref())
+        self.ops.iter().filter_map(|(name, op)| {
+            if op.novalue {
+                Some(name.as_ref())
+            } else {
+                None
+            }
+        })
     }
 
     /// Merges `other` into this registry, returning `&mut Self` for chaining.
@@ -199,7 +212,6 @@ impl OpRegistry {
     /// ```
     pub fn merge(&mut self, other: Self) -> &mut Self {
         self.ops.extend(other.ops);
-        self.novalue_ops.extend(other.novalue_ops);
         self
     }
 }

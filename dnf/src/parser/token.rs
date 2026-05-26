@@ -43,10 +43,10 @@ pub(crate) enum Token {
     Comma,        // ,
 
     // Map target tokens
-    MapKeys,   // .@keys
-    MapValues, // .@values
+    MapKeys,
+    MapValues,
 
-    // Internal sentinel; not produced by the tokenizer.
+    /// Internal sentinel produced after `mem::replace` consumes a token slot.
     Consumed,
 }
 
@@ -88,6 +88,63 @@ impl std::fmt::Display for Token {
             Token::MapValues => write!(f, ".@values"),
             Token::Consumed => write!(f, "<consumed>"),
         }
+    }
+}
+
+type CharStream<'a> = std::iter::Peekable<std::str::CharIndices<'a>>;
+
+#[inline]
+fn skip_whitespace(chars: &mut CharStream<'_>) {
+    while let Some(&(_, ch)) = chars.peek() {
+        if ch.is_whitespace() {
+            chars.next();
+        } else {
+            break;
+        }
+    }
+}
+
+/// Skips whitespace and consumes an identifier.
+///
+/// Returns the start position (or `fallback_pos` at end of input) and the identifier.
+fn read_keyword(chars: &mut CharStream<'_>, fallback_pos: usize) -> (usize, String) {
+    skip_whitespace(chars);
+    let start = chars.peek().map(|(p, _)| *p).unwrap_or(fallback_pos);
+    let mut word = String::new();
+    while let Some(&(_, ch)) = chars.peek() {
+        if ch.is_alphanumeric() || ch == '_' {
+            word.push(ch);
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    (start, word)
+}
+
+/// Skips whitespace and verifies the next identifier matches `expected`.
+fn expect_keyword(
+    chars: &mut CharStream<'_>,
+    expected: &str,
+    fallback_pos: usize,
+    input: &str,
+    expected_label: &str,
+) -> Result<(), DnfError> {
+    let (pos, word) = read_keyword(chars, fallback_pos);
+    if word == expected {
+        Ok(())
+    } else {
+        let found = if word.is_empty() {
+            "end of expression".to_string()
+        } else {
+            word
+        };
+        Err(DnfError::UnexpectedToken {
+            expected: expected_label.to_string(),
+            found,
+            position: pos,
+            input: input.to_string(),
+        })
     }
 }
 
@@ -262,8 +319,20 @@ pub(crate) fn tokenize(
                     }
                 }
 
-                while let Some(&(_, ch)) = chars.peek() {
-                    if ch.is_ascii_digit() || ch == '.' {
+                let mut seen_dot = number.contains('.');
+                while let Some(&(dot_pos, ch)) = chars.peek() {
+                    if ch.is_ascii_digit() {
+                        number.push(ch);
+                        chars.next();
+                    } else if ch == '.' {
+                        if seen_dot {
+                            return Err(DnfError::InvalidNumber {
+                                value: number,
+                                position: dot_pos,
+                                input: input_string.clone(),
+                            });
+                        }
+                        seen_dot = true;
                         number.push(ch);
                         chars.next();
                     } else {
@@ -313,30 +382,7 @@ pub(crate) fn tokenize(
                     "IN" => tokens.push(Token::AnyOf), // IN is alias for ANY OF
                     "BETWEEN" => tokens.push(Token::Between),
                     "NOT" => {
-                        // Check for "NOT CONTAINS", "NOT STARTS WITH", "NOT ENDS WITH", "NOT ALL OF", "NOT ANY OF"
-                        // Skip whitespace
-                        while let Some(&(_, ch)) = chars.peek() {
-                            if ch.is_whitespace() {
-                                chars.next();
-                            } else {
-                                break;
-                            }
-                        }
-
-                        // Track position where next word should start
-                        let next_word_pos = chars.peek().map(|(p, _)| *p).unwrap_or(pos);
-
-                        // Read next word
-                        let mut next_word = String::new();
-                        while let Some(&(_, ch)) = chars.peek() {
-                            if ch.is_alphanumeric() || ch == '_' {
-                                next_word.push(ch);
-                                chars.next();
-                            } else {
-                                break;
-                            }
-                        }
-
+                        let (next_word_pos, next_word) = read_keyword(&mut chars, pos);
                         if next_word.is_empty() {
                             return Err(DnfError::UnexpectedToken {
                                 expected:
@@ -347,100 +393,39 @@ pub(crate) fn tokenize(
                                 input: input_string.clone(),
                             });
                         }
-
                         match next_word.as_str() {
                             "CONTAINS" => tokens.push(Token::NotContains),
                             "IN" => tokens.push(Token::NotAnyOf), // NOT IN is alias for NOT ANY OF
                             "BETWEEN" => tokens.push(Token::NotBetween),
                             "STARTS" => {
-                                // Read "WITH"
-                                while let Some(&(_, ch)) = chars.peek() {
-                                    if ch.is_whitespace() {
-                                        chars.next();
-                                    } else {
-                                        break;
-                                    }
-                                }
-                                let with_pos = chars.peek().map(|(p, _)| *p).unwrap_or(pos);
-                                let mut with_word = String::new();
-                                while let Some(&(_, ch)) = chars.peek() {
-                                    if ch.is_alphanumeric() || ch == '_' {
-                                        with_word.push(ch);
-                                        chars.next();
-                                    } else {
-                                        break;
-                                    }
-                                }
-                                if with_word == "WITH" {
-                                    tokens.push(Token::NotStartsWith);
-                                } else {
-                                    return Err(DnfError::UnexpectedToken {
-                                        expected: "WITH (after NOT STARTS)".to_string(),
-                                        found: with_word,
-                                        position: with_pos,
-                                        input: input_string.clone(),
-                                    });
-                                }
+                                expect_keyword(
+                                    &mut chars,
+                                    "WITH",
+                                    pos,
+                                    &input_string,
+                                    "WITH (after NOT STARTS)",
+                                )?;
+                                tokens.push(Token::NotStartsWith);
                             }
                             "ENDS" => {
-                                // Read "WITH"
-                                while let Some(&(_, ch)) = chars.peek() {
-                                    if ch.is_whitespace() {
-                                        chars.next();
-                                    } else {
-                                        break;
-                                    }
-                                }
-                                let with_pos = chars.peek().map(|(p, _)| *p).unwrap_or(pos);
-                                let mut with_word = String::new();
-                                while let Some(&(_, ch)) = chars.peek() {
-                                    if ch.is_alphanumeric() || ch == '_' {
-                                        with_word.push(ch);
-                                        chars.next();
-                                    } else {
-                                        break;
-                                    }
-                                }
-                                if with_word == "WITH" {
-                                    tokens.push(Token::NotEndsWith);
-                                } else {
-                                    return Err(DnfError::UnexpectedToken {
-                                        expected: "WITH (after NOT ENDS)".to_string(),
-                                        found: with_word,
-                                        position: with_pos,
-                                        input: input_string.clone(),
-                                    });
-                                }
+                                expect_keyword(
+                                    &mut chars,
+                                    "WITH",
+                                    pos,
+                                    &input_string,
+                                    "WITH (after NOT ENDS)",
+                                )?;
+                                tokens.push(Token::NotEndsWith);
                             }
                             "ALL" => {
-                                // Read "OF"
-                                while let Some(&(_, ch)) = chars.peek() {
-                                    if ch.is_whitespace() {
-                                        chars.next();
-                                    } else {
-                                        break;
-                                    }
-                                }
-                                let of_pos = chars.peek().map(|(p, _)| *p).unwrap_or(pos);
-                                let mut of_word = String::new();
-                                while let Some(&(_, ch)) = chars.peek() {
-                                    if ch.is_alphanumeric() || ch == '_' {
-                                        of_word.push(ch);
-                                        chars.next();
-                                    } else {
-                                        break;
-                                    }
-                                }
-                                if of_word == "OF" {
-                                    tokens.push(Token::NotAllOf);
-                                } else {
-                                    return Err(DnfError::UnexpectedToken {
-                                        expected: "OF (after NOT ALL)".to_string(),
-                                        found: of_word,
-                                        position: of_pos,
-                                        input: input_string.clone(),
-                                    });
-                                }
+                                expect_keyword(
+                                    &mut chars,
+                                    "OF",
+                                    pos,
+                                    &input_string,
+                                    "OF (after NOT ALL)",
+                                )?;
+                                tokens.push(Token::NotAllOf);
                             }
                             // "NOT ANY" is not supported - use "NOT IN" instead
                             _ => {
@@ -456,139 +441,28 @@ pub(crate) fn tokenize(
                         }
                     }
                     "STARTS" => {
-                        // Check for "STARTS WITH"
-                        // Skip whitespace
-                        while let Some(&(_, ch)) = chars.peek() {
-                            if ch.is_whitespace() {
-                                chars.next();
-                            } else {
-                                break;
-                            }
-                        }
-
-                        // Track position where next word should start
-                        let next_word_pos = chars.peek().map(|(p, _)| *p).unwrap_or(pos);
-
-                        // Read next word
-                        let mut next_word = String::new();
-                        while let Some(&(_, ch)) = chars.peek() {
-                            if ch.is_alphanumeric() || ch == '_' {
-                                next_word.push(ch);
-                                chars.next();
-                            } else {
-                                break;
-                            }
-                        }
-
-                        if next_word.is_empty() {
-                            return Err(DnfError::UnexpectedToken {
-                                expected: "WITH (after STARTS)".to_string(),
-                                found: "end of expression".to_string(),
-                                position: next_word_pos,
-                                input: input_string.clone(),
-                            });
-                        }
-
-                        if next_word == "WITH" {
-                            tokens.push(Token::StartsWith);
-                        } else {
-                            return Err(DnfError::UnexpectedToken {
-                                expected: "WITH (after STARTS)".to_string(),
-                                found: next_word,
-                                position: next_word_pos,
-                                input: input_string.clone(),
-                            });
-                        }
+                        expect_keyword(
+                            &mut chars,
+                            "WITH",
+                            pos,
+                            &input_string,
+                            "WITH (after STARTS)",
+                        )?;
+                        tokens.push(Token::StartsWith);
                     }
                     "ENDS" => {
-                        // Check for "ENDS WITH"
-                        // Skip whitespace
-                        while let Some(&(_, ch)) = chars.peek() {
-                            if ch.is_whitespace() {
-                                chars.next();
-                            } else {
-                                break;
-                            }
-                        }
-
-                        // Track position where next word should start
-                        let next_word_pos = chars.peek().map(|(p, _)| *p).unwrap_or(pos);
-
-                        // Read next word
-                        let mut next_word = String::new();
-                        while let Some(&(_, ch)) = chars.peek() {
-                            if ch.is_alphanumeric() || ch == '_' {
-                                next_word.push(ch);
-                                chars.next();
-                            } else {
-                                break;
-                            }
-                        }
-
-                        if next_word.is_empty() {
-                            return Err(DnfError::UnexpectedToken {
-                                expected: "WITH (after ENDS)".to_string(),
-                                found: "end of expression".to_string(),
-                                position: next_word_pos,
-                                input: input_string.clone(),
-                            });
-                        }
-
-                        if next_word == "WITH" {
-                            tokens.push(Token::EndsWith);
-                        } else {
-                            return Err(DnfError::UnexpectedToken {
-                                expected: "WITH (after ENDS)".to_string(),
-                                found: next_word,
-                                position: next_word_pos,
-                                input: input_string.clone(),
-                            });
-                        }
+                        expect_keyword(
+                            &mut chars,
+                            "WITH",
+                            pos,
+                            &input_string,
+                            "WITH (after ENDS)",
+                        )?;
+                        tokens.push(Token::EndsWith);
                     }
                     "ALL" => {
-                        // Check for "ALL OF"
-                        // Skip whitespace
-                        while let Some(&(_, ch)) = chars.peek() {
-                            if ch.is_whitespace() {
-                                chars.next();
-                            } else {
-                                break;
-                            }
-                        }
-
-                        // Track position where next word should start
-                        let next_word_pos = chars.peek().map(|(p, _)| *p).unwrap_or(pos);
-
-                        // Read next word
-                        let mut next_word = String::new();
-                        while let Some(&(_, ch)) = chars.peek() {
-                            if ch.is_alphanumeric() || ch == '_' {
-                                next_word.push(ch);
-                                chars.next();
-                            } else {
-                                break;
-                            }
-                        }
-
-                        if next_word.is_empty() {
-                            return Err(DnfError::UnexpectedToken {
-                                expected: "OF (after ALL)".to_string(),
-                                found: "end of expression".to_string(),
-                                position: next_word_pos,
-                                input: input_string.clone(),
-                            });
-                        }
-
-                        if next_word == "OF" {
-                            tokens.push(Token::AllOf);
-                        } else {
-                            return Err(DnfError::UnexpectedToken {
-                                expected: "OF (after ALL)".to_string(),
-                                found: next_word,
-                                position: next_word_pos,
-                                input: input_string.clone(),
-                            });
-                        }
+                        expect_keyword(&mut chars, "OF", pos, &input_string, "OF (after ALL)")?;
+                        tokens.push(Token::AllOf);
                     }
                     // "ANY" is not supported - use "IN" instead
                     // ANY OF has been replaced by IN operator
@@ -1088,6 +962,25 @@ mod tests {
                     expected
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_tokenize_invalid_numbers() {
+        let cases = vec![
+            ("two dots", "x == 1.2.3"),
+            ("trailing extra dot", "x == 1.2.3.4"),
+            ("multiple dots no digits", "x == 1.."),
+        ];
+
+        for (name, input) in cases {
+            let result = tokenize(input, None);
+            assert!(
+                matches!(result, Err(DnfError::InvalidNumber { .. })),
+                "Expected InvalidNumber for '{}': {}",
+                name,
+                input
+            );
         }
     }
 }

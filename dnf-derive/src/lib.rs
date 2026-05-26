@@ -2,6 +2,13 @@ use proc_macro::TokenStream;
 use quote::quote;
 use syn::{parse_macro_input, Data, DeriveInput, Field, Fields};
 
+/// Primitive type names recognized by the derive macro. These all have
+/// `From<&T>` implementations for `Value` and a `DnfField` impl.
+const PRIMITIVES: &[&str] = &[
+    "i8", "i16", "i32", "i64", "isize", "u8", "u16", "u32", "u64", "usize", "f32", "f64", "bool",
+    "String",
+];
+
 /// Derives `DnfEvaluable` for a struct with named fields.
 ///
 /// The macro generates a `DnfEvaluable` implementation that dispatches on
@@ -249,62 +256,37 @@ fn generate_field_value_arm(field: &Field) -> Option<proc_macro2::TokenStream> {
 /// Check if a type can be converted to Value via From<&T>.
 /// Only returns true for types we know have this implementation.
 fn is_value_convertible(type_str: &str) -> bool {
-    // Primitives
-    let primitives = [
-        "i8", "i16", "i32", "i64", "isize", "u8", "u16", "u32", "u64", "usize", "f32", "f64",
-        "bool", "String",
-    ];
-
-    if primitives.contains(&type_str) {
+    if PRIMITIVES.contains(&type_str) {
         return true;
     }
-
-    // &str variants
     if type_str.starts_with("&") && type_str.contains("str") {
         return true;
     }
-
-    // Cow<str> variants (Cow<'_, str>, Cow<'static, str>, etc.)
     if type_str.starts_with("Cow<") && type_str.contains("str") {
         return true;
     }
-
-    // Box<str>
     if type_str == "Box<str>" {
         return true;
     }
-
-    // Vec<T> where T is primitive
-    if type_str.starts_with("Vec<") {
-        if let Some(inner) = type_str
-            .strip_prefix("Vec<")
-            .and_then(|s| s.strip_suffix(">"))
-        {
-            return primitives.contains(&inner);
-        }
+    if let Some(inner) = type_str
+        .strip_prefix("Vec<")
+        .and_then(|s| s.strip_suffix(">"))
+    {
+        return PRIMITIVES.contains(&inner);
     }
-
-    // HashSet<T> where T is primitive (except floats)
-    if type_str.starts_with("HashSet<") {
-        if let Some(inner) = type_str
-            .strip_prefix("HashSet<")
-            .and_then(|s| s.strip_suffix(">"))
-        {
-            // HashSet doesn't work with f32/f64 (not Hash)
-            return primitives.contains(&inner) && inner != "f32" && inner != "f64";
-        }
+    if let Some(inner) = type_str
+        .strip_prefix("HashSet<")
+        .and_then(|s| s.strip_suffix(">"))
+    {
+        // HashSet doesn't work with f32/f64 (not Hash)
+        return PRIMITIVES.contains(&inner) && inner != "f32" && inner != "f64";
     }
-
-    // Option<T> where T is convertible
-    if type_str.starts_with("Option<") {
-        if let Some(inner) = type_str
-            .strip_prefix("Option<")
-            .and_then(|s| s.strip_suffix(">"))
-        {
-            return is_value_convertible(inner);
-        }
+    if let Some(inner) = type_str
+        .strip_prefix("Option<")
+        .and_then(|s| s.strip_suffix(">"))
+    {
+        return is_value_convertible(inner);
     }
-
     false
 }
 
@@ -400,42 +382,40 @@ fn is_string_key(key_type: &str) -> bool {
         || (t.starts_with("&'") && (t.ends_with("str") || t.ends_with(" str")))
 }
 
-/// Check if field has #[dnf(skip)] attribute
-fn has_skip_attribute(field: &Field) -> bool {
+/// Walks every `#[dnf(...)]` attribute on `field` and invokes `visit` on
+/// each nested meta entry. Errors during nested parsing are silently
+/// swallowed — the helper attribute syntax is checked at compile time by
+/// the proc-macro caller.
+fn for_each_dnf_meta(field: &Field, mut visit: impl FnMut(&syn::meta::ParseNestedMeta<'_>)) {
     for attr in &field.attrs {
         if attr.path().is_ident("dnf") {
-            let mut has_skip = false;
             let _ = attr.parse_nested_meta(|meta| {
-                if meta.path.is_ident("skip") {
-                    has_skip = true;
-                }
+                visit(&meta);
                 Ok(())
             });
-            if has_skip {
-                return true;
-            }
         }
     }
-    false
+}
+
+/// Check if field has a `#[dnf(<flag>)]` marker.
+fn has_dnf_flag(field: &Field, flag: &str) -> bool {
+    let mut found = false;
+    for_each_dnf_meta(field, |meta| {
+        if meta.path.is_ident(flag) {
+            found = true;
+        }
+    });
+    found
+}
+
+/// Check if field has #[dnf(skip)] attribute
+fn has_skip_attribute(field: &Field) -> bool {
+    has_dnf_flag(field, "skip")
 }
 
 /// Check if field has #[dnf(nested)] attribute
 fn has_nested_attribute(field: &Field) -> bool {
-    for attr in &field.attrs {
-        if attr.path().is_ident("dnf") {
-            let mut has_nested = false;
-            let _ = attr.parse_nested_meta(|meta| {
-                if meta.path.is_ident("nested") {
-                    has_nested = true;
-                }
-                Ok(())
-            });
-            if has_nested {
-                return true;
-            }
-        }
-    }
-    false
+    has_dnf_flag(field, "nested")
 }
 
 /// Generate a match arm for nested field access.
@@ -487,64 +467,14 @@ fn generate_nested_field_match_arm(field: &Field) -> Option<proc_macro2::TokenSt
     } else if type_str.starts_with("HashMap<") || type_str.starts_with("BTreeMap<") {
         // HashMap<K, V> with nested values
         // Requires explicit syntax: @values.field, @keys, ["key"].field
-        quote! {
-            if let Some(rest) = inner.strip_prefix("@values.") {
-                // branches.@values.city -> iterate values, query city
-                self.#field_name.values().any(|item| item.evaluate_field(rest, operator, value))
-            } else if inner == "@keys" {
-                // branches.@keys -> use any on keys (strings)
-                operator.any(self.#field_name.keys(), value)
-            } else if inner.starts_with("[\"") {
-                // branches["key"].field -> access specific key, then nested field
-                if let Some(end_bracket) = inner.find("\"]") {
-                    let key = &inner[2..end_bracket];
-                    let rest = inner.get(end_bracket + 2..).unwrap_or("").trim_start_matches('.');
-                    if rest.is_empty() {
-                        // branches["key"] alone - not meaningful for nested structs
-                        false
-                    } else {
-                        match self.#field_name.get(key) {
-                            Some(item) => item.evaluate_field(rest, operator, value),
-                            None => false,
-                        }
-                    }
-                } else {
-                    false
-                }
-            } else {
-                // No implicit @values - require explicit syntax
-                false
-            }
-        }
+        let body = nested_map_dispatch(quote! { self.#field_name });
+        quote! { #body }
     } else if type_str.starts_with("Option<HashMap<") || type_str.starts_with("Option<BTreeMap<") {
         // Option<HashMap<K, V>> with nested - requires explicit syntax
+        let body = nested_map_dispatch(quote! { map });
         quote! {
             match &self.#field_name {
-                Some(map) => {
-                    if let Some(rest) = inner.strip_prefix("@values.") {
-                        map.values().any(|item| item.evaluate_field(rest, operator, value))
-                    } else if inner == "@keys" {
-                        operator.any(map.keys(), value)
-                    } else if inner.starts_with("[\"") {
-                        if let Some(end_bracket) = inner.find("\"]") {
-                            let key = &inner[2..end_bracket];
-                            let rest = inner.get(end_bracket + 2..).unwrap_or("").trim_start_matches('.');
-                            if rest.is_empty() {
-                                false
-                            } else {
-                                match map.get(key) {
-                                    Some(item) => item.evaluate_field(rest, operator, value),
-                                    None => false,
-                                }
-                            }
-                        } else {
-                            false
-                        }
-                    } else {
-                        // No implicit @values - require explicit syntax
-                        false
-                    }
-                },
+                Some(map) => { #body },
                 None => false,
             }
         }
@@ -566,6 +496,37 @@ fn generate_nested_field_match_arm(field: &Field) -> Option<proc_macro2::TokenSt
     Some(quote! {
         #query_name => #delegation_code,
     })
+}
+
+/// Emits the runtime dispatch for nested map access (`@values.field`,
+/// `@keys`, `["key"].field`). Used by both bare `HashMap`/`BTreeMap`
+/// fields and their `Option<…>` wrappers; `map_expr` is the expression
+/// that evaluates to the map (`self.field` or a bound `map` ident).
+fn nested_map_dispatch(map_expr: proc_macro2::TokenStream) -> proc_macro2::TokenStream {
+    quote! {
+        if let Some(rest) = inner.strip_prefix("@values.") {
+            #map_expr.values().any(|item| item.evaluate_field(rest, operator, value))
+        } else if inner == "@keys" {
+            operator.any(#map_expr.keys(), value)
+        } else if inner.starts_with("[\"") {
+            if let Some(end_bracket) = inner.find("\"]") {
+                let key = &inner[2..end_bracket];
+                let rest = inner.get(end_bracket + 2..).unwrap_or("").trim_start_matches('.');
+                if rest.is_empty() {
+                    false
+                } else {
+                    match #map_expr.get(key) {
+                        Some(item) => item.evaluate_field(rest, operator, value),
+                        None => false,
+                    }
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    }
 }
 
 /// Emits a `validate_field_path` arm that recurses into a scalar nested
@@ -618,25 +579,17 @@ fn generate_validate_field_path_arm(field: &Field) -> Option<proc_macro2::TokenS
 
 /// Get rename attribute value if present
 fn get_rename_attribute(field: &Field) -> Option<String> {
-    for attr in &field.attrs {
-        if attr.path().is_ident("dnf") {
-            let mut rename_value = None;
-            let _ = attr.parse_nested_meta(|meta| {
-                if meta.path.is_ident("rename") {
-                    if let Ok(value) = meta.value() {
-                        if let Ok(lit_str) = value.parse::<syn::LitStr>() {
-                            rename_value = Some(lit_str.value());
-                        }
-                    }
+    let mut rename_value = None;
+    for_each_dnf_meta(field, |meta| {
+        if meta.path.is_ident("rename") {
+            if let Ok(value) = meta.value() {
+                if let Ok(lit_str) = value.parse::<syn::LitStr>() {
+                    rename_value = Some(lit_str.value());
                 }
-                Ok(())
-            });
-            if let Some(name) = rename_value {
-                return Some(name);
             }
         }
-    }
-    None
+    });
+    rename_value
 }
 
 /// Get iter attribute value if present.
@@ -645,28 +598,23 @@ fn get_rename_attribute(field: &Field) -> Option<String> {
 /// - `Some(Some("method"))` for `#[dnf(iter = "method")]` (uses custom method)
 /// - `None` if not present
 fn get_iter_attribute(field: &Field) -> Option<Option<String>> {
-    for attr in &field.attrs {
-        if attr.path().is_ident("dnf") {
-            let mut has_iter = false;
-            let mut iter_method = None;
-            let _ = attr.parse_nested_meta(|meta| {
-                if meta.path.is_ident("iter") {
-                    has_iter = true;
-                    // Check if it has a value (e.g., iter = "method")
-                    if let Ok(value) = meta.value() {
-                        if let Ok(lit_str) = value.parse::<syn::LitStr>() {
-                            iter_method = Some(lit_str.value());
-                        }
-                    }
+    let mut has_iter = false;
+    let mut iter_method = None;
+    for_each_dnf_meta(field, |meta| {
+        if meta.path.is_ident("iter") {
+            has_iter = true;
+            if let Ok(value) = meta.value() {
+                if let Ok(lit_str) = value.parse::<syn::LitStr>() {
+                    iter_method = Some(lit_str.value());
                 }
-                Ok(())
-            });
-            if has_iter {
-                return Some(iter_method);
             }
         }
+    });
+    if has_iter {
+        Some(iter_method)
+    } else {
+        None
     }
-    None
 }
 
 /// Generate value conversion code based on field type.
@@ -703,63 +651,38 @@ fn generate_value_conversion(
 ///
 /// Returns false for custom types that require nested field access delegation.
 fn is_primitive_or_builtin(type_str: &str) -> bool {
-    // Primitives
-    let primitives = [
-        "i8", "i16", "i32", "i64", "isize", "u8", "u16", "u32", "u64", "usize", "f32", "f64",
-        "bool", "String",
-    ];
-
-    if primitives.contains(&type_str) {
+    if PRIMITIVES.contains(&type_str) {
         return true;
     }
-
-    // &str variants
     if type_str.starts_with("&") && type_str.contains("str") {
         return true;
     }
-
-    // Cow<str> variants (Cow<'_, str>, Cow<'static, str>, etc.)
     if type_str.starts_with("Cow<") && type_str.contains("str") {
         return true;
     }
-
-    // Box<str>
     if type_str == "Box<str>" {
         return true;
     }
-
-    // Vec<T> variants - check if inner type is supported
-    if type_str.starts_with("Vec<") {
-        if let Some(inner) = type_str.strip_prefix("Vec<") {
-            if let Some(inner) = inner.strip_suffix(">") {
-                // Recursively check if inner type is supported
-                return is_primitive_or_builtin(inner);
-            }
-        }
+    if let Some(inner) = type_str
+        .strip_prefix("Vec<")
+        .and_then(|s| s.strip_suffix(">"))
+    {
+        return is_primitive_or_builtin(inner);
     }
-
-    // HashSet<T> variants - check if inner type is supported
-    // Note: floats (f32, f64) are NOT supported in HashSet because they don't implement Hash
-    if type_str.starts_with("HashSet<") {
-        if let Some(inner) = type_str.strip_prefix("HashSet<") {
-            if let Some(inner) = inner.strip_suffix(">") {
-                // Floats don't implement Hash, so they can't be used in HashSet
-                if inner == "f32" || inner == "f64" {
-                    return false;
-                }
-                // Recursively check if inner type is supported
-                return is_primitive_or_builtin(inner);
-            }
+    if let Some(inner) = type_str
+        .strip_prefix("HashSet<")
+        .and_then(|s| s.strip_suffix(">"))
+    {
+        if inner == "f32" || inner == "f64" {
+            return false;
         }
+        return is_primitive_or_builtin(inner);
     }
-
-    // HashMap<K, V> or BTreeMap<K, V> - check key is string-like and value is supported
     if is_map_type(type_str) {
         if let Some((key_type, value_type)) = extract_map_types(type_str) {
             return is_string_key(&key_type) && is_primitive_or_builtin(&value_type);
         }
     }
-
     false
 }
 

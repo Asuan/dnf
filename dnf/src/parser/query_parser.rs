@@ -73,6 +73,48 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Builds an `UnexpectedToken` error at the current parser position.
+    fn unexpected(&self, expected: impl Into<String>) -> DnfError {
+        DnfError::UnexpectedToken {
+            expected: expected.into(),
+            found: self
+                .peek()
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "EOF".to_string()),
+            position: self.current,
+            input: self.input.clone(),
+        }
+    }
+
+    /// Parses a numeric literal, inferring `Float`/`Int`/`Uint` from its shape.
+    fn parse_numeric_literal(&self, num: &str, position: usize) -> Result<Value, DnfError> {
+        if num.contains('.') || num.contains('e') || num.contains('E') {
+            num.parse::<f64>()
+                .map(Value::Float)
+                .map_err(|_| DnfError::InvalidNumber {
+                    value: num.to_string(),
+                    position,
+                    input: self.input.clone(),
+                })
+        } else if num.starts_with('-') {
+            num.parse::<i64>()
+                .map(Value::Int)
+                .map_err(|_| DnfError::InvalidNumber {
+                    value: num.to_string(),
+                    position,
+                    input: self.input.clone(),
+                })
+        } else {
+            num.parse::<u64>()
+                .map(Value::Uint)
+                .map_err(|_| DnfError::InvalidNumber {
+                    value: num.to_string(),
+                    position,
+                    input: self.input.clone(),
+                })
+        }
+    }
+
     /// Parse the tokens into a DnfQuery.
     pub(crate) fn parse(mut self) -> Result<DnfQuery, DnfError> {
         if self.tokens.is_empty() {
@@ -83,15 +125,7 @@ impl<'a> Parser<'a> {
 
         // Ensure we consumed all tokens
         if !self.is_at_end() {
-            return Err(DnfError::UnexpectedToken {
-                expected: "end of input".to_string(),
-                found: self
-                    .peek()
-                    .map(|t| t.to_string())
-                    .unwrap_or_else(|| "EOF".to_string()),
-                position: self.current,
-                input: self.input.clone(),
-            });
+            return Err(self.unexpected("end of input"));
         }
 
         Ok(DnfQuery::from_conjunctions(conjunctions))
@@ -123,15 +157,7 @@ impl<'a> Parser<'a> {
 
         // If we had an opening paren, expect a closing one
         if has_parens && !self.match_token(&Token::RightParen) {
-            return Err(DnfError::UnexpectedToken {
-                expected: ")".to_string(),
-                found: self
-                    .peek()
-                    .map(|t| t.to_string())
-                    .unwrap_or_else(|| "EOF".to_string()),
-                position: self.current,
-                input: self.input.clone(),
-            });
+            return Err(self.unexpected(")"));
         }
 
         Ok(Conjunction::from_conditions(conditions))
@@ -205,7 +231,7 @@ impl<'a> Parser<'a> {
 
             if map_target.is_some() {
                 // Map targets always use flexible parsing
-                self.parse_map_value(map_target)?
+                self.parse_value_flexible()?
             } else if is_flexible_operator {
                 self.parse_value_flexible()?
             } else if is_between_operator {
@@ -290,24 +316,10 @@ impl<'a> Parser<'a> {
 
         // Expect closing bracket
         if !self.match_token(&Token::RightBracket) {
-            return Err(DnfError::UnexpectedToken {
-                expected: "]".to_string(),
-                found: self
-                    .peek()
-                    .map(|t| t.to_string())
-                    .unwrap_or_else(|| "EOF".to_string()),
-                position: self.current,
-                input: self.input.clone(),
-            });
+            return Err(self.unexpected("]"));
         }
 
         Ok(key)
-    }
-
-    /// Parse a value for map operations.
-    fn parse_map_value(&mut self, _map_target: Option<MapTarget>) -> Result<Value, DnfError> {
-        // Map targets use flexible parsing
-        self.parse_value_flexible()
     }
 
     /// Parse an operator token.
@@ -464,15 +476,7 @@ impl<'a> Parser<'a> {
 
         // Consume '['
         if !self.match_token(&Token::LeftBracket) {
-            return Err(DnfError::UnexpectedToken {
-                expected: "[".to_string(),
-                found: self
-                    .peek()
-                    .map(|t| t.to_string())
-                    .unwrap_or_else(|| "EOF".to_string()),
-                position: self.current,
-                input: self.input.clone(),
-            });
+            return Err(self.unexpected("["));
         }
 
         // Determine target array type from field type
@@ -494,117 +498,57 @@ impl<'a> Parser<'a> {
 
         // Consume ']'
         if !self.match_token(&Token::RightBracket) {
-            return Err(DnfError::UnexpectedToken {
-                expected: "]".to_string(),
-                found: self
-                    .peek()
-                    .map(|t| t.to_string())
-                    .unwrap_or_else(|| "EOF".to_string()),
-                position: self.current,
-                input: self.input.clone(),
-            });
+            return Err(self.unexpected("]"));
         }
 
-        // Convert to appropriate Value type
+        // Convert to appropriate Value type. parse_number_token only returns
+        // Int/Uint/Float, so the unreachable arms stay unreachable.
         if is_float {
-            let float_values: Result<Vec<f64>, DnfError> = values
-                .into_iter()
-                .map(|v| match v {
-                    Value::Float(f) => Ok(f),
-                    Value::Int(i) => Ok(i as f64),
-                    Value::Uint(u) => Ok(u as f64),
-                    _ => unreachable!("parse_number_token returns only Int/Uint/Float"),
-                })
-                .collect();
-            Ok(Value::FloatArray(float_values?.into_boxed_slice()))
-        } else if is_signed {
-            // Check if all values are already Int - avoid conversion
-            let all_int = values.iter().all(|v| matches!(v, Value::Int(_)));
-            if all_int {
-                let int_values: Vec<i64> = values
-                    .into_iter()
-                    .map(|v| match v {
-                        Value::Int(i) => i,
-                        _ => unreachable!("already checked all are Int"),
-                    })
-                    .collect();
-                Ok(Value::IntArray(int_values.into_boxed_slice()))
-            } else {
-                // Need to convert Uint to Int
-                let int_values: Result<Vec<i64>, DnfError> = values
-                    .into_iter()
-                    .map(|v| match v {
-                        Value::Int(i) => Ok(i),
-                        Value::Uint(u) if u <= i64::MAX as u64 => Ok(u as i64),
-                        Value::Uint(u) => Err(self.type_mismatch_error(
-                            base_type,
-                            format!("signed integer (max {})", i64::MAX),
-                            format!("unsigned integer {}", u),
-                        )),
-                        _ => unreachable!("parse_number_token returns only Int/Uint/Float"),
-                    })
-                    .collect();
-                Ok(Value::IntArray(int_values?.into_boxed_slice()))
-            }
+            Self::collect_array(values, |v| match v {
+                Value::Float(f) => Ok(f),
+                Value::Int(i) => Ok(i as f64),
+                Value::Uint(u) => Ok(u as f64),
+                _ => unreachable!("parse_number_token returns only Int/Uint/Float"),
+            })
+            .map(Value::FloatArray)
         } else if is_unsigned {
-            // Check if all values are already Uint - avoid conversion
-            let all_uint = values.iter().all(|v| matches!(v, Value::Uint(_)));
-            if all_uint {
-                let uint_values: Vec<u64> = values
-                    .into_iter()
-                    .map(|v| match v {
-                        Value::Uint(u) => u,
-                        _ => unreachable!("already checked all are Uint"),
-                    })
-                    .collect();
-                Ok(Value::UintArray(uint_values.into_boxed_slice()))
-            } else {
-                // Need to convert Int to Uint (must be non-negative)
-                let uint_values: Result<Vec<u64>, DnfError> = values
-                    .into_iter()
-                    .map(|v| match v {
-                        Value::Uint(u) => Ok(u),
-                        Value::Int(i) if i >= 0 => Ok(i as u64),
-                        Value::Int(i) => Err(self.type_mismatch_error(
-                            base_type,
-                            "unsigned integer",
-                            format!("negative integer {}", i),
-                        )),
-                        _ => unreachable!("parse_number_token returns only Int/Uint/Float"),
-                    })
-                    .collect();
-                Ok(Value::UintArray(uint_values?.into_boxed_slice()))
-            }
+            Self::collect_array(values, |v| match v {
+                Value::Uint(u) => Ok(u),
+                Value::Int(i) if i >= 0 => Ok(i as u64),
+                Value::Int(i) => Err(self.type_mismatch_error(
+                    base_type,
+                    "unsigned integer",
+                    format!("negative integer {}", i),
+                )),
+                _ => unreachable!("parse_number_token returns only Int/Uint/Float"),
+            })
+            .map(Value::UintArray)
         } else {
-            // Default to Int if type unknown
-            // Check if all values are already Int - avoid conversion
-            let all_int = values.iter().all(|v| matches!(v, Value::Int(_)));
-            if all_int {
-                let int_values: Vec<i64> = values
-                    .into_iter()
-                    .map(|v| match v {
-                        Value::Int(i) => i,
-                        _ => unreachable!("already checked all are Int"),
-                    })
-                    .collect();
-                Ok(Value::IntArray(int_values.into_boxed_slice()))
-            } else {
-                let int_values: Result<Vec<i64>, DnfError> = values
-                    .into_iter()
-                    .map(|v| match v {
-                        Value::Int(i) => Ok(i),
-                        Value::Uint(u) if u <= i64::MAX as u64 => Ok(u as i64),
-                        Value::Uint(u) => Err(self.type_mismatch_error(
-                            base_type,
-                            format!("signed integer (max {})", i64::MAX),
-                            format!("unsigned integer {}", u),
-                        )),
-                        _ => unreachable!("parse_number_token returns only Int/Uint/Float"),
-                    })
-                    .collect();
-                Ok(Value::IntArray(int_values?.into_boxed_slice()))
-            }
+            // Signed branch and "type unknown" fallback both produce IntArray.
+            Self::collect_array(values, |v| match v {
+                Value::Int(i) => Ok(i),
+                Value::Uint(u) if u <= i64::MAX as u64 => Ok(u as i64),
+                Value::Uint(u) => Err(self.type_mismatch_error(
+                    base_type,
+                    format!("signed integer (max {})", i64::MAX),
+                    format!("unsigned integer {}", u),
+                )),
+                _ => unreachable!("parse_number_token returns only Int/Uint/Float"),
+            })
+            .map(Value::IntArray)
         }
+    }
+
+    /// Maps `values` through `extract` and collects into a boxed slice.
+    fn collect_array<T, F>(values: Vec<Value>, extract: F) -> Result<Box<[T]>, DnfError>
+    where
+        F: FnMut(Value) -> Result<T, DnfError>,
+    {
+        values
+            .into_iter()
+            .map(extract)
+            .collect::<Result<Vec<_>, _>>()
+            .map(Vec::into_boxed_slice)
     }
 
     fn parse_number_token(
@@ -656,15 +600,7 @@ impl<'a> Parser<'a> {
 
         // Consume '['
         if !self.match_token(&Token::LeftBracket) {
-            return Err(DnfError::UnexpectedToken {
-                expected: "[".to_string(),
-                found: self
-                    .peek()
-                    .map(|t| t.to_string())
-                    .unwrap_or_else(|| "EOF".to_string()),
-                position: self.current,
-                input: self.input.clone(),
-            });
+            return Err(self.unexpected("["));
         }
 
         // Handle empty array
@@ -699,15 +635,7 @@ impl<'a> Parser<'a> {
 
         // Consume ']'
         if !self.match_token(&Token::RightBracket) {
-            return Err(DnfError::UnexpectedToken {
-                expected: "] or ,".to_string(),
-                found: self
-                    .peek()
-                    .map(|t| t.to_string())
-                    .unwrap_or_else(|| "EOF".to_string()),
-                position: self.current,
-                input: self.input.clone(),
-            });
+            return Err(self.unexpected("] or ,"));
         }
 
         // Convert to appropriate array type
@@ -787,33 +715,7 @@ impl<'a> Parser<'a> {
 
         match token {
             Token::String(s) => Ok(Value::String(s)),
-            Token::Number(num) => {
-                if num.contains('.') || num.contains('e') || num.contains('E') {
-                    num.parse::<f64>()
-                        .map(Value::Float)
-                        .map_err(|_| DnfError::InvalidNumber {
-                            value: num.to_string(),
-                            position,
-                            input: self.input.clone(),
-                        })
-                } else if num.starts_with('-') {
-                    num.parse::<i64>()
-                        .map(Value::Int)
-                        .map_err(|_| DnfError::InvalidNumber {
-                            value: num.to_string(),
-                            position,
-                            input: self.input.clone(),
-                        })
-                } else {
-                    num.parse::<u64>()
-                        .map(Value::Uint)
-                        .map_err(|_| DnfError::InvalidNumber {
-                            value: num.to_string(),
-                            position,
-                            input: self.input.clone(),
-                        })
-                }
-            }
+            Token::Number(num) => self.parse_numeric_literal(&num, position),
             Token::Boolean(b) => Ok(Value::Bool(b)),
             token => Err(DnfError::UnexpectedToken {
                 expected: "array element (string, number, or boolean)".to_string(),

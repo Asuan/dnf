@@ -131,14 +131,7 @@ impl DnfField for Value {
             Value::None => {
                 // None == None, None != anything else
                 match &op.base {
-                    crate::operator::BaseOperator::Eq => {
-                        let result = matches!(value, Value::None);
-                        if op.inverse {
-                            !result
-                        } else {
-                            result
-                        }
-                    }
+                    crate::operator::BaseOperator::Eq => op.inverse ^ matches!(value, Value::None),
                     _ => false,
                 }
             }
@@ -218,14 +211,9 @@ impl_dnf_field_map!(HashMap, BTreeMap);
 mod tests {
     use super::*;
 
-    /// Test Option<T> evaluation semantics as documented in review issue #6.
-    ///
-    /// For None values:
-    /// - EQ with null returns true
-    /// - NE with null returns false
-    /// - All other operators (GT, LT, GTE, LTE, etc.) return false
-    ///
-    /// This is the current documented behavior, not a bug.
+    /// Verifies `Option<T>` evaluation semantics: for `None`, only `EQ`
+    /// and `NE` against null behave non-trivially (true and false
+    /// respectively); every other operator returns false.
     #[test]
     fn test_option_evaluation_semantics() {
         struct TestCase {

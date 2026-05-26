@@ -1,16 +1,16 @@
 use criterion::{criterion_group, criterion_main, Criterion};
-use dnf::{DnfEvaluable, DnfQuery, Op};
-use std::collections::HashSet;
+#[cfg(feature = "parser")]
+use dnf::QueryBuilder;
+use dnf::{DnfEvaluable, DnfQuery, Op, Value};
+use std::collections::{HashMap, HashSet};
 use std::hint::black_box;
 
-// Nested struct for benchmarks
 #[derive(DnfEvaluable)]
 struct Address {
     city: String,
     country: String,
 }
 
-// Test struct for benchmarks
 #[derive(DnfEvaluable)]
 struct User {
     age: u32,
@@ -24,6 +24,8 @@ struct User {
     skill_scores: Vec<i32>,
     categories: HashSet<String>,
     badge_ids: HashSet<i32>,
+    #[dnf(rename = "metadata")]
+    meta: HashMap<String, String>,
     #[dnf(nested)]
     address: Address,
 }
@@ -49,6 +51,11 @@ impl User {
                 .map(String::from)
                 .collect(),
             badge_ids: [101, 102, 103, 104, 105].into_iter().collect(),
+            meta: HashMap::from([
+                ("author".to_string(), "Alice".to_string()),
+                ("status".to_string(), "published".to_string()),
+                ("version".to_string(), "1.0".to_string()),
+            ]),
             address: Address {
                 city: "San Francisco".to_string(),
                 country: "US".to_string(),
@@ -60,57 +67,36 @@ impl User {
 fn bench_query_evaluation(c: &mut Criterion) {
     let user = User::sample();
 
-    // Simple: single condition
     let simple_query = DnfQuery::builder()
         .or(|conj| conj.and("age", Op::GT, 18))
         .build();
 
-    // Complex: multiple conditions with OR
-    let complex_query = DnfQuery::builder()
-        .or(|conj| {
-            conj.and("age", Op::GT, 18)
-                .and("country", Op::EQ, "US")
-                .and("premium", Op::EQ, true)
-        })
-        .or(|conj| conj.and("verified", Op::EQ, true).and("score", Op::GTE, 80))
-        .build();
-
-    // String operations
     let string_query = DnfQuery::builder()
         .or(|conj| conj.and("name", Op::CONTAINS, "John"))
         .build();
 
-    // Nested field access
     let nested_query = DnfQuery::builder()
         .or(|conj| conj.and("address.city", Op::EQ, "San Francisco"))
         .build();
 
-    // Vec ANY OF
     let vec_any_of = DnfQuery::builder()
         .or(|conj| conj.and("tags", Op::ANY_OF, vec!["rust", "python"]))
         .build();
 
-    // Vec ALL OF
     let vec_all_of = DnfQuery::builder()
         .or(|conj| conj.and("tags", Op::ALL_OF, vec!["developer", "rust"]))
         .build();
 
-    // HashSet ANY OF
     let hashset_any_of = DnfQuery::builder()
         .or(|conj| conj.and("categories", Op::ANY_OF, vec!["backend", "frontend"]))
         .build();
 
-    // HashSet ALL OF
     let hashset_all_of = DnfQuery::builder()
         .or(|conj| conj.and("categories", Op::ALL_OF, vec!["engineering", "backend"]))
         .build();
 
     c.bench_function("eval_simple", |b| {
         b.iter(|| black_box(&simple_query).evaluate(black_box(&user)))
-    });
-
-    c.bench_function("eval_complex", |b| {
-        b.iter(|| black_box(&complex_query).evaluate(black_box(&user)))
     });
 
     c.bench_function("eval_string_contains", |b| {
@@ -138,39 +124,103 @@ fn bench_query_evaluation(c: &mut Criterion) {
     });
 }
 
-fn bench_batch_evaluation(c: &mut Criterion) {
-    let query = DnfQuery::builder()
-        .or(|conj| conj.and("age", Op::GT, 18).and("country", Op::EQ, "US"))
+fn bench_custom_op(c: &mut Criterion) {
+    let user = User::sample();
+
+    // Baseline: same shape but native operator, no custom-op machinery.
+    let baseline = DnfQuery::builder()
+        .or(|c| c.and("name", Op::CONTAINS, "1"))
         .build();
 
-    let users: Vec<User> = (0..100)
-        .map(|i| User {
-            age: 20 + (i % 50),
-            name: format!("User{}", i),
-            email: format!("user{}@example.com", i),
-            country: if i % 2 == 0 { "US" } else { "UK" }.to_string(),
-            premium: i % 3 == 0,
-            verified: i % 2 == 0,
-            score: 50 + (i % 50) as i32,
-            tags: vec![format!("tag{}", i % 5), "developer".to_string()],
-            skill_scores: vec![50 + (i % 30) as i32, 60 + (i % 40) as i32],
-            categories: [format!("cat{}", i % 3), "engineering".to_string()]
-                .into_iter()
-                .collect(),
-            badge_ids: [100 + (i % 10) as i32, 200 + (i % 5) as i32]
-                .into_iter()
-                .collect(),
-            address: Address {
-                city: format!("City{}", i % 10),
-                country: if i % 2 == 0 { "US" } else { "UK" }.to_string(),
-            },
-        })
-        .collect();
+    // Custom op registered AND used: exercises field_value() + registry lookup
+    // + indirect call. The op operates on the String `name` field, so the
+    // hot path includes a `Box<str>` allocation in `field_value`.
+    let registered = DnfQuery::builder()
+        .with_custom_op(
+            "HAS_DIGIT",
+            true,
+            |field, _| matches!(field, Value::String(s) if s.chars().any(|c| c.is_ascii_digit())),
+        )
+        .or(|c| c.and("name", Op::custom("HAS_DIGIT"), Value::None))
+        .build();
 
-    c.bench_function("eval_batch_100_users", |b| {
-        b.iter(|| users.iter().filter(|u| query.evaluate(*u)).count())
+    // Registry attached but the requested op is missing: field_value() still
+    // gets called (and allocated) but the registry returns None.
+    let unregistered = DnfQuery::builder()
+        .with_custom_op("OTHER_OP", true, |_, _| true)
+        .or(|c| c.and("name", Op::custom("MISSING_OP"), Value::None))
+        .build();
+
+    c.bench_function("eval_custom_op_baseline", |b| {
+        b.iter(|| black_box(&baseline).evaluate(black_box(&user)))
+    });
+
+    c.bench_function("eval_custom_op_registered", |b| {
+        b.iter(|| black_box(&registered).evaluate(black_box(&user)))
+    });
+
+    c.bench_function("eval_custom_op_unregistered", |b| {
+        b.iter(|| black_box(&unregistered).evaluate(black_box(&user)))
     });
 }
 
-criterion_group!(benches, bench_query_evaluation, bench_batch_evaluation);
+fn bench_map_fields(c: &mut Criterion) {
+    let user = User::sample();
+
+    let at_key = DnfQuery::builder()
+        .or(|c| c.and("metadata", Op::EQ, Value::at_key("author", "Alice")))
+        .build();
+
+    let keys_contains = DnfQuery::builder()
+        .or(|c| c.and("metadata", Op::CONTAINS, Value::keys("author")))
+        .build();
+
+    let values_any_of = DnfQuery::builder()
+        .or(|c| c.and("metadata", Op::ANY_OF, Value::values(vec!["Alice", "Bob"])))
+        .build();
+
+    c.bench_function("eval_map_at_key", |b| {
+        b.iter(|| black_box(&at_key).evaluate(black_box(&user)))
+    });
+
+    c.bench_function("eval_map_keys_contains", |b| {
+        b.iter(|| black_box(&keys_contains).evaluate(black_box(&user)))
+    });
+
+    c.bench_function("eval_map_values_any_of", |b| {
+        b.iter(|| black_box(&values_any_of).evaluate(black_box(&user)))
+    });
+}
+
+#[cfg(feature = "parser")]
+fn bench_parser(c: &mut Criterion) {
+    let simple = "age > 18";
+    let complex = r#"(age > 18 AND country == "US" AND name CONTAINS "John") OR (premium == true AND verified == true AND score >= 80) OR tags IN ["rust", "python"] OR badge_ids NOT IN [999, 1000]"#;
+
+    c.bench_function("parse_simple", |b| {
+        b.iter(|| QueryBuilder::from_query::<User>(black_box(simple)).unwrap())
+    });
+
+    c.bench_function("parse_complex", |b| {
+        b.iter(|| QueryBuilder::from_query::<User>(black_box(complex)).unwrap())
+    });
+}
+
+#[cfg(feature = "parser")]
+criterion_group!(
+    benches,
+    bench_query_evaluation,
+    bench_custom_op,
+    bench_map_fields,
+    bench_parser
+);
+
+#[cfg(not(feature = "parser"))]
+criterion_group!(
+    benches,
+    bench_query_evaluation,
+    bench_custom_op,
+    bench_map_fields
+);
+
 criterion_main!(benches);

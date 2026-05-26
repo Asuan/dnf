@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-05-26
+
+### Added
+
+- `MAX_SAFE_INTEGER_FOR_FLOAT` constant (`2^53`) — re-exported at the crate root and referenced by the `Int`/`Uint` ↔ `Float` comparison docs as the precision-loss boundary.
+- Benchmark coverage for custom operators, map-field queries (`@keys` / `@values`), and the string-query parser; duplicate benches removed.
+
+### Changed
+
+- `DnfQuery`'s `PartialEq` now also compares the set of registered custom-operator names, not just the conjunctions. Two queries with different custom-op registrations are no longer treated as equal even when their conjunctions match.
+- Parser rejects numeric literals containing more than one decimal point (e.g. `1.2.3`) with `DnfError::InvalidNumber` instead of accepting them silently.
+- Internal refactors with no public-API impact: tokenizer keyword-reading helpers, parser numeric-literal helper, derive-macro restructuring, `OpRegistry` storage compaction, deduplicated `DnfQuery::merge` / `QueryBuilder::or_query` and `DnfQuery::validate` / `QueryBuilder::validate` paths.
+
 ## [0.2.0] - 2026-04-29
 
 ### Added

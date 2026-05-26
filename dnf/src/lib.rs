@@ -197,6 +197,8 @@ pub use operator::{BaseOperator, ComparisonOrdering};
 pub use query::{Condition, Conjunction, DnfQuery};
 /// Typed value used inside a [`Condition`].
 pub use value::Value;
+/// Largest integer that round-trips exactly through an [`f64`].
+pub use value::MAX_SAFE_INTEGER_FOR_FLOAT;
 
 /// Derive macro that generates a [`DnfEvaluable`] implementation for a struct.
 #[cfg(feature = "derive")]

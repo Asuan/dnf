@@ -164,15 +164,12 @@ impl QueryBuilder {
     #[must_use]
     pub fn or_query(mut self, query: DnfQuery) -> Self {
         let (conjunctions, custom_ops) = query.into_parts();
-        self.conjunctions.extend(conjunctions);
-        if let Some(other_ops) = custom_ops {
-            match &mut self.custom_ops {
-                Some(ops) => {
-                    ops.merge(other_ops);
-                }
-                None => self.custom_ops = Some(other_ops),
-            }
-        }
+        crate::query::merge_into(
+            &mut self.conjunctions,
+            &mut self.custom_ops,
+            conjunctions,
+            custom_ops,
+        );
         self
     }
 
@@ -272,45 +269,9 @@ impl QueryBuilder {
     ///   a map-targeted [`Value`] (such as [`Value::AtKey`]) is applied to a
     ///   non-map field.
     pub fn validate<T: crate::DnfEvaluable>(self) -> Result<Self, crate::DnfError> {
-        use crate::FieldKind;
-
         for conj in &self.conjunctions {
-            for cond in conj.conditions() {
-                if let Some(custom_name) = cond.operator().custom_name() {
-                    let registered = self
-                        .custom_ops
-                        .as_ref()
-                        .is_some_and(|r| r.contains(custom_name));
-                    if !registered {
-                        return Err(crate::DnfError::UnregisteredCustomOp {
-                            operator_name: custom_name.into(),
-                        });
-                    }
-                }
-            }
+            conj.validate::<T>(&|name| self.custom_ops.as_ref().is_some_and(|r| r.contains(name)))?;
         }
-
-        for conj in &self.conjunctions {
-            for cond in conj.conditions() {
-                let field_name = cond.field_name();
-                let value = cond.value();
-
-                let field_kind = T::validate_field_path(field_name).ok_or_else(|| {
-                    crate::DnfError::UnknownField {
-                        field_name: field_name.into(),
-                        position: None,
-                    }
-                })?;
-
-                if value.is_map_targeted() && field_kind != FieldKind::Map {
-                    return Err(crate::DnfError::InvalidMapTarget {
-                        field_name: field_name.into(),
-                        field_kind,
-                    });
-                }
-            }
-        }
-
         Ok(self)
     }
 

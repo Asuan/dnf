@@ -3,6 +3,9 @@ use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::fmt;
 
+/// Largest integer that round-trips exactly through an [`f64`].
+pub const MAX_SAFE_INTEGER_FOR_FLOAT: i64 = 1_i64 << f64::MANTISSA_DIGITS;
+
 // String types support cross-type comparisons via string representation.
 
 impl PartialOrd<Value> for str {
@@ -52,7 +55,7 @@ macro_rules! impl_partial_ord_numeric {
     };
 }
 
-// Apply macro (i64, u64, f64 have manual implementations below)
+// i64, u64, f64 have manual implementations below.
 impl_partial_ord_numeric!(i32, i16, i8, isize => i64);
 impl_partial_ord_numeric!(u32, u16, u8, usize => u64);
 impl_partial_ord_numeric!(f32 => f64);
@@ -377,7 +380,8 @@ impl Value {
         Value::BoolSet(Box::new(set))
     }
 
-    /// Convert value to string representation for string operations.
+    /// Returns a string representation suitable for the string operators
+    /// (CONTAINS, STARTS WITH, ENDS WITH).
     ///
     /// This is used internally for string operators (CONTAINS, STARTS WITH, ENDS WITH)
     /// when applied to non-string values.
@@ -800,8 +804,8 @@ impl PartialOrd for Value {
     }
 }
 
-/// Escape a string for use in query syntax.
-/// Escapes: backslash, double quote, newline, tab, carriage return, forward slash.
+/// Returns the input with query-syntax metacharacters escaped.
+/// Escaped characters: backslash, double quote, newline, tab, carriage return, forward slash.
 fn escape_string(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     for ch in s.chars() {
@@ -1381,50 +1385,66 @@ mod tests {
 
     #[test]
     fn test_escape_string() {
-        assert_eq!(escape_string("simple"), "simple");
-        assert_eq!(escape_string("with \"quotes\""), "with \\\"quotes\\\"");
-        assert_eq!(escape_string("with\\backslash"), "with\\\\backslash");
-        assert_eq!(escape_string("with\nnewline"), "with\\nnewline");
-        assert_eq!(escape_string("with\ttab"), "with\\ttab");
-        assert_eq!(escape_string("with/slash"), "with\\/slash");
-        assert_eq!(
-            escape_string("C:\\Path\\To\\File"),
-            "C:\\\\Path\\\\To\\\\File"
-        );
-        assert_eq!(
-            escape_string("He said \"Hello\"\nNext line"),
-            "He said \\\"Hello\\\"\\nNext line"
-        );
+        let cases = vec![
+            // (input, expected, description)
+            ("simple", "simple", "no escapes"),
+            ("with \"quotes\"", "with \\\"quotes\\\"", "double quotes"),
+            ("with\\backslash", "with\\\\backslash", "backslash"),
+            ("with\nnewline", "with\\nnewline", "newline"),
+            ("with\ttab", "with\\ttab", "tab"),
+            ("with/slash", "with\\/slash", "forward slash"),
+            (
+                "C:\\Path\\To\\File",
+                "C:\\\\Path\\\\To\\\\File",
+                "windows path",
+            ),
+            (
+                "He said \"Hello\"\nNext line",
+                "He said \\\"Hello\\\"\\nNext line",
+                "mixed quotes and newline",
+            ),
+        ];
+        for (input, expected, desc) in cases {
+            assert_eq!(escape_string(input), expected, "Failed: {}", desc);
+        }
     }
 
     #[test]
     fn test_value_display_with_escapes() {
-        // String with quotes
-        let val = Value::String(Box::from("He said \"Hello\""));
-        assert_eq!(val.to_string(), r#""He said \"Hello\"""#);
-
-        // String with backslashes
-        let val = Value::String(Box::from("C:\\Users\\Test"));
-        assert_eq!(val.to_string(), r#""C:\\Users\\Test""#);
-
-        // String with newlines and tabs
-        let val = Value::String(Box::from("Line1\nLine2\tTabbed"));
-        assert_eq!(val.to_string(), r#""Line1\nLine2\tTabbed""#);
-
-        // String with forward slash
-        let val = Value::String(Box::from("https://example.com"));
-        assert_eq!(val.to_string(), r#""https:\/\/example.com""#);
-
-        // String array with special characters
-        let val = Value::from(vec![
-            "simple".to_string(),
-            "with \"quotes\"".to_string(),
-            "with\\slash".to_string(),
-        ]);
-        assert_eq!(
-            val.to_string(),
-            r#"["simple", "with \"quotes\"", "with\\slash"]"#
-        );
+        let cases: Vec<(Value, &str, &str)> = vec![
+            (
+                Value::String(Box::from("He said \"Hello\"")),
+                r#""He said \"Hello\"""#,
+                "string with quotes",
+            ),
+            (
+                Value::String(Box::from("C:\\Users\\Test")),
+                r#""C:\\Users\\Test""#,
+                "string with backslashes",
+            ),
+            (
+                Value::String(Box::from("Line1\nLine2\tTabbed")),
+                r#""Line1\nLine2\tTabbed""#,
+                "string with newlines and tabs",
+            ),
+            (
+                Value::String(Box::from("https://example.com")),
+                r#""https:\/\/example.com""#,
+                "string with forward slashes",
+            ),
+            (
+                Value::from(vec![
+                    "simple".to_string(),
+                    "with \"quotes\"".to_string(),
+                    "with\\slash".to_string(),
+                ]),
+                r#"["simple", "with \"quotes\"", "with\\slash"]"#,
+                "string array with special characters",
+            ),
+        ];
+        for (value, expected, desc) in cases {
+            assert_eq!(value.to_string(), expected, "Failed: {}", desc);
+        }
     }
 
     // ==================== Data-Driven Equality Tests ====================

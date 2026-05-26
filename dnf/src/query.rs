@@ -1,6 +1,26 @@
 use crate::{DnfEvaluable, Op, OpRegistry, Value};
 use std::fmt;
 
+/// Merges another query's parts into the caller using `OR`-combination semantics.
+///
+/// Shared by [`DnfQuery::merge`] and [`crate::QueryBuilder::or_query`].
+pub(crate) fn merge_into(
+    target_conjs: &mut Vec<Conjunction>,
+    target_ops: &mut Option<OpRegistry>,
+    src_conjs: Vec<Conjunction>,
+    src_ops: Option<OpRegistry>,
+) {
+    target_conjs.extend(src_conjs);
+    if let Some(other_ops) = src_ops {
+        match target_ops {
+            Some(ops) => {
+                ops.merge(other_ops);
+            }
+            None => *target_ops = Some(other_ops),
+        }
+    }
+}
+
 /// Represents a single `field operator value` test in a DNF query.
 ///
 /// Conditions are the leaves of a query: a [`Conjunction`] is an `AND` of
@@ -152,6 +172,42 @@ impl Conjunction {
             .all(|condition| condition.evaluate(target))
     }
 
+    /// Validates every condition in this conjunction against `T`'s fields and the custom-op predicate.
+    pub(crate) fn validate<T: DnfEvaluable>(
+        &self,
+        has_custom_op: &impl Fn(&str) -> bool,
+    ) -> Result<(), crate::DnfError> {
+        use crate::FieldKind;
+
+        for cond in self.conditions() {
+            if let Some(custom_name) = cond.operator().custom_name() {
+                if !has_custom_op(custom_name) {
+                    return Err(crate::DnfError::UnregisteredCustomOp {
+                        operator_name: custom_name.into(),
+                    });
+                }
+            }
+
+            let field_name = cond.field_name();
+            let value = cond.value();
+
+            let field_kind = T::validate_field_path(field_name).ok_or_else(|| {
+                crate::DnfError::UnknownField {
+                    field_name: field_name.into(),
+                    position: None,
+                }
+            })?;
+
+            if value.is_map_targeted() && field_kind != FieldKind::Map {
+                return Err(crate::DnfError::InvalidMapTarget {
+                    field_name: field_name.into(),
+                    field_kind,
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Returns the number of conditions in this conjunction.
     pub fn len(&self) -> usize {
         self.conditions.len()
@@ -209,7 +265,20 @@ pub struct DnfQuery {
 impl PartialEq for DnfQuery {
     fn eq(&self, other: &Self) -> bool {
         // custom_ops holds function pointers, which have no equality.
-        self.conjunctions == other.conjunctions
+        // Compare the registered name sets so a missing registration is
+        // not silently treated as equal.
+        if self.conjunctions != other.conjunctions {
+            return false;
+        }
+        match (&self.custom_ops, &other.custom_ops) {
+            (None, None) => true,
+            (Some(a), Some(b)) => {
+                let a_names: std::collections::HashSet<&str> = a.operator_names().collect();
+                let b_names: std::collections::HashSet<&str> = b.operator_names().collect();
+                a_names == b_names
+            }
+            _ => false,
+        }
     }
 }
 
@@ -481,31 +550,9 @@ impl DnfQuery {
     /// # Ok::<(), dnf::DnfError>(())
     /// ```
     pub fn validate<T: crate::DnfEvaluable>(self) -> Result<Self, crate::DnfError> {
-        use crate::FieldKind;
-
-        self.validate_custom_ops()?;
-
         for conj in &self.conjunctions {
-            for condition in conj.conditions() {
-                let field_name = condition.field_name();
-                let value = condition.value();
-
-                let field_kind = T::validate_field_path(field_name).ok_or_else(|| {
-                    crate::DnfError::UnknownField {
-                        field_name: field_name.into(),
-                        position: None,
-                    }
-                })?;
-
-                if value.is_map_targeted() && field_kind != FieldKind::Map {
-                    return Err(crate::DnfError::InvalidMapTarget {
-                        field_name: field_name.into(),
-                        field_kind,
-                    });
-                }
-            }
+            conj.validate::<T>(&|name| self.has_custom_op(name))?;
         }
-
         Ok(self)
     }
 
@@ -527,15 +574,12 @@ impl DnfQuery {
     #[must_use]
     pub fn merge(mut self, other: Self) -> Self {
         let (conjunctions, custom_ops) = other.into_parts();
-        self.conjunctions.extend(conjunctions);
-        if let Some(other_ops) = custom_ops {
-            match &mut self.custom_ops {
-                Some(ops) => {
-                    ops.merge(other_ops);
-                }
-                None => self.custom_ops = Some(other_ops),
-            }
-        }
+        merge_into(
+            &mut self.conjunctions,
+            &mut self.custom_ops,
+            conjunctions,
+            custom_ops,
+        );
         self
     }
 }

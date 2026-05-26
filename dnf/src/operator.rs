@@ -321,11 +321,7 @@ impl Op {
             BaseOperator::AllOf | BaseOperator::AnyOf | BaseOperator::Between => false,
             BaseOperator::Custom(_) => return false, // Custom ops handled at query level
         };
-        if self.inverse {
-            !result
-        } else {
-            result
-        }
+        self.inverse ^ result
     }
 
     /// Compare a signed integer field against a query value.
@@ -359,11 +355,7 @@ impl Op {
             BaseOperator::AllOf | BaseOperator::AnyOf => false,
             BaseOperator::Custom(_) => return false,
         };
-        if self.inverse {
-            !result
-        } else {
-            result
-        }
+        self.inverse ^ result
     }
 
     /// Compare an unsigned integer field against a query value.
@@ -397,11 +389,7 @@ impl Op {
             BaseOperator::AllOf | BaseOperator::AnyOf => false,
             BaseOperator::Custom(_) => return false,
         };
-        if self.inverse {
-            !result
-        } else {
-            result
-        }
+        self.inverse ^ result
     }
 
     /// Compare a float field against a query value.
@@ -435,11 +423,7 @@ impl Op {
             BaseOperator::AllOf | BaseOperator::AnyOf => false,
             BaseOperator::Custom(_) => return false,
         };
-        if self.inverse {
-            !result
-        } else {
-            result
-        }
+        self.inverse ^ result
     }
 
     /// Compare a boolean field against a query value.
@@ -457,11 +441,7 @@ impl Op {
             BaseOperator::AllOf | BaseOperator::AnyOf | BaseOperator::Between => false,
             BaseOperator::Custom(_) => return false,
         };
-        if self.inverse {
-            !result
-        } else {
-            result
-        }
+        self.inverse ^ result
     }
 
     /// Applies the operator to an iterator of field values.
@@ -502,11 +482,7 @@ impl Op {
             BaseOperator::Custom(_) => return false,
         };
 
-        if self.inverse {
-            !result
-        } else {
-            result
-        }
+        self.inverse ^ result
     }
 
     /// Eq operator: collection equals single value only if it has exactly one matching element
