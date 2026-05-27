@@ -12,7 +12,7 @@ documentation = "https://docs.rs/dnf"
 readme = "../README.md"
 keywords = ["dnf", "query", "filter", "dsl", "expression"]
 categories = ["data-structures", "parser-implementations"]
-exclude = ["/.github", ".gitignore", "target/"]
+exclude = ["/.github", ".gitignore", "target/", "Makefile"]
 
 [package.metadata.docs.rs]
 all-features = true
