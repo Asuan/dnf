@@ -414,14 +414,10 @@ impl DnfQuery {
                     let result = registry
                         .evaluate(custom_name, &field_value, &cond.value)
                         .unwrap_or(false);
-                    return if cond.operator.is_inverse() {
-                        !result
-                    } else {
-                        result
-                    };
+                    return cond.operator.is_inverse() ^ result;
                 }
             }
-            return cond.operator.is_inverse();
+            return false;
         }
 
         target.evaluate_field(&cond.field_name, &cond.operator, &cond.value)
