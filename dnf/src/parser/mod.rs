@@ -4,7 +4,7 @@
 //! `(age > 18 AND country == "US") OR premium == true` into a
 //! [`DnfQuery`]. The internal tokenizer and recursive-descent
 //! parser are not exposed; build queries through
-//! [`QueryBuilder::from_query`](crate::QueryBuilder::from_query) or
+//! [`DnfQuery::parse`](crate::DnfQuery::parse) or
 //! [`QueryBuilder::parse`](crate::QueryBuilder::parse).
 //!
 //! Lexer and grammar errors surface as parser-specific variants on

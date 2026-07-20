@@ -36,10 +36,16 @@
 //!     .build();
 //! ```
 //!
-//! Or use the parser — it validates automatically:
+//! Or use the parser — it validates automatically (requires the `parser` feature):
 //!
-//! ```rust,ignore
-//! let query = DnfQuery::parse::<User>("age > 18")?;
+//! ```rust
+//! # use dnf::{DnfEvaluable, DnfQuery};
+//! # #[derive(DnfEvaluable)]
+//! # struct User { age: u32 }
+//! # #[cfg(feature = "parser")] {
+//! let query = DnfQuery::parse::<User>("age > 18").unwrap();
+//! assert_eq!(query.len(), 1);
+//! # }
 //! ```
 //!
 //! ## Features

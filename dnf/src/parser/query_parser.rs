@@ -4,6 +4,17 @@ use super::token::Token;
 use crate::error::DnfError;
 use crate::{Condition, Conjunction, DnfQuery, FieldInfo, FieldKind, Op, Value};
 
+/// Returns a human-readable kind name for an array element, for error messages.
+fn array_element_kind(value: &Value) -> &'static str {
+    match value {
+        Value::String(_) => "string",
+        Value::Int(_) | Value::Uint(_) => "integer",
+        Value::Float(_) => "float",
+        Value::Bool(_) => "boolean",
+        _ => "unsupported value",
+    }
+}
+
 /// Map target for map field operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MapTarget {
@@ -612,25 +623,11 @@ impl<'a> Parser<'a> {
         }
 
         // Parse first element to determine array type
-        let first_element = self.parse_array_element()?;
-        let mut elements = vec![first_element.clone()];
+        let mut elements = vec![self.parse_array_element()?];
 
         // Parse remaining elements
         while self.match_token(&Token::Comma) {
-            let element = self.parse_array_element()?;
-
-            // Verify type consistency
-            if std::mem::discriminant(&element) != std::mem::discriminant(&first_element) {
-                return Err(DnfError::TypeMismatch {
-                    field: "array".into(),
-                    expected: format!("{:?}", std::mem::discriminant(&first_element))
-                        .into_boxed_str(),
-                    actual: format!("{:?}", std::mem::discriminant(&element)).into_boxed_str(),
-                    position: Some(self.current - 1),
-                });
-            }
-
-            elements.push(element);
+            elements.push(self.parse_array_element()?);
         }
 
         // Consume ']'
@@ -638,72 +635,93 @@ impl<'a> Parser<'a> {
             return Err(self.unexpected("] or ,"));
         }
 
-        // Convert to appropriate array type
-        match &first_element {
-            Value::String(_) => {
-                let strings: Vec<Box<str>> = elements
-                    .into_iter()
-                    .filter_map(|v| {
-                        if let Value::String(s) = v {
-                            Some(s)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                Ok(Value::StringArray(strings.into_boxed_slice()))
-            }
-            Value::Int(_) => {
-                let ints: Vec<i64> = elements
-                    .into_iter()
-                    .filter_map(|v| if let Value::Int(i) = v { Some(i) } else { None })
-                    .collect();
-                Ok(Value::IntArray(ints.into_boxed_slice()))
-            }
-            Value::Uint(_) => {
-                let uints: Vec<u64> = elements
-                    .into_iter()
-                    .filter_map(|v| {
-                        if let Value::Uint(u) = v {
-                            Some(u)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                Ok(Value::UintArray(uints.into_boxed_slice()))
-            }
-            Value::Float(_) => {
+        self.build_array(elements, start_position)
+    }
+
+    /// Builds a homogeneous array [`Value`] from parsed elements.
+    ///
+    /// Numeric elements are promoted to a common type so mixed-sign and
+    /// int/float literals parse: `Uint` widens to `Int` when any element is
+    /// signed, and everything widens to `Float` when any element is a float.
+    /// Thus `[-5, 0, 5]` yields an [`Value::IntArray`] and `[1, 2.5]` a
+    /// [`Value::FloatArray`]. Strings and booleans are not promoted and must be
+    /// uniform.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DnfError::TypeMismatch`] if the elements mix incompatible
+    /// kinds (e.g. strings with numbers) or if a positive value in an otherwise
+    /// signed array exceeds [`i64::MAX`].
+    fn build_array(&self, elements: Vec<Value>, position: usize) -> Result<Value, DnfError> {
+        let all_numeric = elements
+            .iter()
+            .all(|v| matches!(v, Value::Int(_) | Value::Uint(_) | Value::Float(_)));
+
+        if all_numeric {
+            // `Int` only arises from a leading `-`, so "any signed" == "any negative".
+            let any_float = elements.iter().any(|v| matches!(v, Value::Float(_)));
+            let any_signed = elements.iter().any(|v| matches!(v, Value::Int(_)));
+
+            if any_float {
                 let floats: Vec<f64> = elements
                     .into_iter()
-                    .filter_map(|v| {
-                        if let Value::Float(f) = v {
-                            Some(f)
-                        } else {
-                            None
-                        }
+                    .map(|v| match v {
+                        Value::Float(f) => f,
+                        Value::Int(i) => i as f64,
+                        Value::Uint(u) => u as f64,
+                        _ => unreachable!("all elements are numeric"),
                     })
                     .collect();
-                Ok(Value::FloatArray(floats.into_boxed_slice()))
-            }
-            Value::Bool(_) => {
-                let bools: Vec<bool> = elements
+                return Ok(Value::FloatArray(floats.into_boxed_slice()));
+            } else if any_signed {
+                return Self::collect_array(elements, |v| match v {
+                    Value::Int(i) => Ok(i),
+                    Value::Uint(u) if u <= i64::MAX as u64 => Ok(u as i64),
+                    Value::Uint(u) => Err(self.type_mismatch_error(
+                        "array",
+                        format!("signed integer (max {})", i64::MAX),
+                        format!("unsigned integer {u}"),
+                    )),
+                    _ => unreachable!("all elements are numeric"),
+                })
+                .map(Value::IntArray);
+            } else {
+                let uints: Vec<u64> = elements
                     .into_iter()
-                    .filter_map(|v| {
-                        if let Value::Bool(b) = v {
-                            Some(b)
-                        } else {
-                            None
-                        }
+                    .map(|v| match v {
+                        Value::Uint(u) => u,
+                        _ => unreachable!("no float and no signed element means all uint"),
                     })
                     .collect();
-                Ok(Value::BoolArray(bools.into_boxed_slice()))
+                return Ok(Value::UintArray(uints.into_boxed_slice()));
             }
-            _ => Err(DnfError::TypeMismatch {
+        }
+
+        // Non-numeric arrays must be uniformly strings or uniformly booleans.
+        match &elements[0] {
+            Value::String(_) => Self::collect_array(elements, |v| match v {
+                Value::String(s) => Ok(s),
+                other => Err(self.type_mismatch_error(
+                    "array",
+                    "string elements",
+                    array_element_kind(&other),
+                )),
+            })
+            .map(Value::StringArray),
+            Value::Bool(_) => Self::collect_array(elements, |v| match v {
+                Value::Bool(b) => Ok(b),
+                other => Err(self.type_mismatch_error(
+                    "array",
+                    "boolean elements",
+                    array_element_kind(&other),
+                )),
+            })
+            .map(Value::BoolArray),
+            other => Err(DnfError::TypeMismatch {
                 field: "array".into(),
                 expected: "string, number, or boolean elements".into(),
-                actual: format!("{:?}", first_element).into_boxed_str(),
-                position: Some(start_position),
+                actual: array_element_kind(other).into(),
+                position: Some(position),
             }),
         }
     }
@@ -1115,6 +1133,22 @@ mod tests {
                 "price IN [9.99, 19.99, 29.99]",
                 vec![FieldInfo::new("price", "f64")],
                 Box::new(|v: &Value| matches!(v, Value::FloatArray(arr) if arr.len() == 3)),
+            ),
+            (
+                "mixed-sign array promotes to int",
+                "value IN [-5, 0, 5]",
+                vec![FieldInfo::new("value", "i32")],
+                Box::new(
+                    |v: &Value| matches!(v, Value::IntArray(arr) if arr.as_ref() == [-5, 0, 5]),
+                ),
+            ),
+            (
+                "int/float mix promotes to float",
+                "price IN [1, 2, 3.5]",
+                vec![FieldInfo::new("price", "f64")],
+                Box::new(
+                    |v: &Value| matches!(v, Value::FloatArray(arr) if arr.as_ref() == [1.0, 2.0, 3.5]),
+                ),
             ),
             (
                 "boolean array",

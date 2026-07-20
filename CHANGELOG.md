@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-07-20
+
+### Added
+
+- `DnfQuery::parse::<T>(query)` for string parsing; `QueryBuilder::from_query` now delegates to it.
+- `LICENSE-MIT` and `LICENSE-APACHE` files so published crates ship their license text.
+
+### Fixed
+
+- Parser errors no longer panic on non-ASCII queries (snippet now slices on char boundaries).
+- Unregistered inverse custom operators (e.g. a typo'd `Op::not_custom`) no longer match every target.
+- Mixed-sign and int/float arrays now parse (`[-5, 0, 5]`, `[1, 2.5]`) via numeric promotion.
+
+### Changed
+
+- `ANY OF` / `ALL OF` over strings allocate once per option instead of per (field, option) pair (`eval_vec_any_of` ~65 ns → ~27 ns).
+- Pinned `dnf-derive` to `=0.2.2`; trimmed a trailing space from the SPDX `license` string.
+- Simplify custom op logic (be same with defaults)
+
 ## [0.2.1] - 2026-05-26
 
 ### Added

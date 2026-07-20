@@ -16,6 +16,14 @@ A Rust library for building and evaluating [DNF (Disjunctive Normal Form)](https
 ## Quick Start
 
 ```rust
+use dnf::QueryBuilder;
+
+let query = QueryBuilder::from_query::<User>("age > 18")?;
+```
+
+or via code
+
+```rust
 use dnf::{DnfEvaluable, DnfQuery, Op};
 
 #[derive(DnfEvaluable)]
@@ -42,12 +50,6 @@ let query = DnfQuery::builder()
 ```
 
 Or use the parser — it validates automatically:
-
-```rust
-use dnf::QueryBuilder;
-
-let query = QueryBuilder::from_query::<User>("age > 18")?;
-```
 
 ## Features
 

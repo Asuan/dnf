@@ -559,12 +559,6 @@ impl Op {
     /// - ALL OF ["a", "b", "a"] is equivalent to ALL OF ["a", "b"]
     /// - Field ["a", "b", "c"] matches both queries (contains all distinct values)
     /// - Field ["a", "a", "a"] does NOT match ALL OF ["a", "b"] (missing "b")
-    ///
-    /// # Performance Issue
-    ///
-    /// TODO: Same optimization opportunities as iter_any_of (see above)
-    /// - StringSet: all_of_strs allocates `Box<str>` via Value::from() for each comparison
-    /// - With extraction pattern or specialization: zero allocations, O(m) with O(1) lookups
     fn iter_all_of<'a, I, T>(field_iter: I, query_value: &Value) -> bool
     where
         I: ExactSizeIterator<Item = &'a T> + Clone,
@@ -591,6 +585,9 @@ impl Op {
     }
 
     /// Helper for ALL OF with string values.
+    ///
+    /// TODO: allocates a `Box<str>` per option via `Value::from`; a zero-alloc
+    /// path (extraction with `O(1)` set lookups) remains possible.
     fn all_of_strs<'a, 'b, I, T, R, S>(field_iter: I, mut required: R) -> bool
     where
         I: ExactSizeIterator<Item = &'a T> + Clone,
@@ -599,9 +596,8 @@ impl Op {
         S: 'b + AsRef<str> + ?Sized,
     {
         required.all(|req| {
-            field_iter
-                .clone()
-                .any(|item| item == &Value::from(req.as_ref())) // TODO: Same allocation issue as iter_any_of
+            let v = Value::from(req.as_ref());
+            field_iter.clone().any(|item| item == &v)
         })
     }
 
@@ -670,39 +666,22 @@ impl Op {
     ///
     /// Semantics: "field contains at least one of the search values"
     ///
-    /// # Performance Issue
-    ///
-    /// TODO: Optimize using specialization or extraction pattern (performance regression)
-    ///
-    /// **Current (slow)**: O(n×m) with allocations
-    /// - StringSet: `Value::from(opt.as_ref())` allocates `Box<str>` for EVERY comparison
-    /// - Benchmark: ~115ns (263% regression from previous implementation)
-    ///
-    /// **Previous (fast)**: O(n) with O(1) HashSet lookups, zero allocations
-    /// - Used `FieldValue::extract()` to get `ExtractedValue::Str(&str)` without allocation
-    /// - `opts.contains(s)` enabled O(1) HashSet lookup instead of O(m) linear scan
-    /// - Benchmark: ~31ns
-    ///
-    /// **Solutions**:
-    /// 1. Restore `FieldValue::extract()` pattern (brings back ~200 LOC, proven fast)
-    /// 2. Use specialization when stable (generic fallback + specialized fast paths)
-    /// 3. Provide concrete `DnfField` impls for `HashSet<String>`, `HashSet<i64>`, etc.
-    ///    (breaks `HashSet<CustomType>` support, requires explicit nested attribute)
-    ///
-    /// See: field.rs `HashSet<T>` impl for specialization details
+    /// TODO: allocates a `Box<str>` per option via `Value::from`; a zero-alloc
+    /// path (extraction with `O(1)` set lookups) remains possible.
     fn iter_any_of<'a, I, T>(mut field_iter: I, query_value: &Value) -> bool
     where
-        I: Iterator<Item = &'a T>,
+        I: Iterator<Item = &'a T> + Clone,
         T: 'a + PartialEq<Value> + PartialOrd<Value>,
     {
         match query_value {
-            Value::StringArray(opts) => {
-                field_iter.any(|item| opts.iter().any(|opt| item == &Value::from(opt.as_ref())))
-            }
-            Value::StringSet(opts) => {
-                // TODO: This allocates Box<str> for every comparison - performance regression
-                field_iter.any(|item| opts.iter().any(|opt| item == &Value::from(opt.as_ref())))
-            }
+            Value::StringArray(opts) => opts.iter().any(|opt| {
+                let v = Value::from(opt.as_ref());
+                field_iter.clone().any(|item| item == &v)
+            }),
+            Value::StringSet(opts) => opts.iter().any(|opt| {
+                let v = Value::from(opt.as_ref());
+                field_iter.clone().any(|item| item == &v)
+            }),
 
             Value::IntArray(opts) => {
                 field_iter.any(|item| opts.iter().any(|&opt| item == &Value::Int(opt)))

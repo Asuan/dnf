@@ -21,18 +21,25 @@ fn format_location(position: usize, input: &str) -> String {
 /// truncated) for human-readable parser-error context.
 #[cfg(feature = "parser")]
 fn get_context(input: &str, position: usize) -> String {
-    let chars: Vec<char> = input.chars().collect();
-    let len = chars.len();
+    let len = input.len();
 
-    let start = position.saturating_sub(20);
-    let end = (position + 20).min(len);
+    // `position` is a byte offset; clamp it and snap the ±20-byte window to
+    // char boundaries so slicing never splits a multi-byte code point.
+    let pos = position.min(len);
+    let mut start = pos.saturating_sub(20);
+    while start < pos && !input.is_char_boundary(start) {
+        start += 1;
+    }
+    let mut end = (pos + 20).min(len);
+    while end > pos && !input.is_char_boundary(end) {
+        end -= 1;
+    }
 
     let mut snippet = String::new();
     if start > 0 {
         snippet.push_str("...");
     }
-    let text: String = chars[start..end].iter().collect();
-    snippet.push_str(&text);
+    snippet.push_str(&input[start..end]);
     if end < len {
         snippet.push_str("...");
     }
@@ -277,29 +284,35 @@ mod parser_error_tests {
     #[test]
     fn test_get_context() {
         type Validator = Box<dyn Fn(&str) -> bool>;
-        let cases: Vec<(&'static str, &'static str, usize, Validator)> = vec![
+        let cases: Vec<(&'static str, String, usize, Validator)> = vec![
             (
                 "short input fits without ellipses",
-                "age > 18",
+                "age > 18".to_string(),
                 5,
                 Box::new(|c: &str| c == "age > 18"),
             ),
             (
                 "position at start has no leading ellipsis",
-                "this is a long query string",
+                "this is a long query string".to_string(),
                 0,
                 Box::new(|c: &str| !c.starts_with("...")),
             ),
             (
                 "position at end has no trailing ellipsis",
-                "this is a long query string",
+                "this is a long query string".to_string(),
                 "this is a long query string".len() - 1,
                 Box::new(|c: &str| !c.ends_with("...")),
+            ),
+            (
+                "multi-byte input with byte position past char count does not panic",
+                "я".repeat(25),
+                50,
+                Box::new(|c: &str| !c.is_empty()),
             ),
         ];
 
         for (desc, input, position, validator) in cases {
-            let context = get_context(input, position);
+            let context = get_context(&input, position);
             assert!(
                 validator(&context),
                 "case '{}': context did not satisfy validator, got: '{}'",

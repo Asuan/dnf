@@ -37,7 +37,8 @@ impl QueryBuilder {
     ///
     /// This is a one-shot constructor: it does not return a builder, so it
     /// cannot be chained with [`or`](Self::or) or
-    /// [`with_custom_op`](Self::with_custom_op). Use [`parse`](Self::parse) to
+    /// [`with_custom_op`](Self::with_custom_op). See also
+    /// [`DnfQuery::parse`](crate::DnfQuery::parse), or [`parse`](Self::parse) to
     /// merge a parsed query into an existing builder.
     ///
     /// # Examples
@@ -60,13 +61,7 @@ impl QueryBuilder {
     /// if the query references a field not declared on `T`.
     #[cfg(feature = "parser")]
     pub fn from_query<T: crate::DnfEvaluable>(query: &str) -> Result<DnfQuery, crate::DnfError> {
-        let fields: Vec<_> = T::fields().collect();
-        crate::parser::parse_with_fields(
-            query,
-            &fields,
-            None::<std::iter::Empty<&str>>,
-            None::<std::iter::Empty<&str>>,
-        )
+        DnfQuery::parse::<T>(query)
     }
 
     /// Parses a query string and appends its conjunctions to this builder.

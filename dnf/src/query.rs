@@ -236,7 +236,7 @@ impl fmt::Display for Conjunction {
 /// A query in disjunctive normal form: an `OR` of [`Conjunction`]s.
 ///
 /// Construct with [`DnfQuery::builder`] or, with the `parser` feature, with
-/// [`QueryBuilder::from_query`](crate::QueryBuilder::from_query).
+/// [`DnfQuery::parse`](crate::DnfQuery::parse).
 ///
 /// # Examples
 ///
@@ -312,6 +312,41 @@ impl DnfQuery {
     /// Returns a new [`QueryBuilder`](crate::QueryBuilder) for fluent construction.
     pub fn builder() -> crate::builder::QueryBuilder {
         crate::builder::QueryBuilder::new()
+    }
+
+    /// Parses a query string, validating field names against `T`.
+    ///
+    /// This is the string-parsing counterpart to [`builder`](Self::builder).
+    /// Field names in `query` are checked against [`T::fields`](crate::DnfEvaluable::fields)
+    /// at parse time, so a typo'd field is rejected before evaluation.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use dnf::{DnfEvaluable, DnfQuery};
+    ///
+    /// #[derive(DnfEvaluable)]
+    /// struct User { age: u32 }
+    ///
+    /// let query = DnfQuery::parse::<User>("age > 18")?;
+    /// assert_eq!(query.len(), 1);
+    /// # Ok::<(), dnf::DnfError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns a parser variant of [`DnfError`](crate::DnfError) if `query` is not
+    /// syntactically valid, or [`DnfError::UnknownField`](crate::DnfError::UnknownField)
+    /// if the query references a field not declared on `T`.
+    #[cfg(feature = "parser")]
+    pub fn parse<T: DnfEvaluable>(query: &str) -> Result<DnfQuery, crate::DnfError> {
+        let fields: Vec<_> = T::fields().collect();
+        crate::parser::parse_with_fields(
+            query,
+            &fields,
+            None::<std::iter::Empty<&str>>,
+            None::<std::iter::Empty<&str>>,
+        )
     }
 
     /// Returns the attached custom-operator registry, or `None` if none was set.
@@ -411,9 +446,10 @@ impl DnfQuery {
         if let Some(custom_name) = cond.operator.custom_name() {
             if let Some(registry) = &self.custom_ops {
                 if let Some(field_value) = target.field_value(&cond.field_name) {
-                    let result = registry
-                        .evaluate(custom_name, &field_value, &cond.value)
-                        .unwrap_or(false);
+                    let Some(result) = registry.evaluate(custom_name, &field_value, &cond.value)
+                    else {
+                        return false;
+                    };
                     return cond.operator.is_inverse() ^ result;
                 }
             }
@@ -1512,6 +1548,29 @@ mod tests {
         // No custom op registered - should return false
         let query = DnfQuery::builder()
             .or(|c| c.and("age", Op::custom("UNKNOWN_OP"), Value::None))
+            .build();
+
+        assert!(!query.evaluate(&user));
+    }
+
+    #[test]
+    fn test_custom_operator_unregistered_inverse_is_false() {
+        let user = MockWithFieldValue {
+            age: 25,
+            score: 85.0,
+            name: "Alice".to_string(),
+        };
+
+        // A registry exists (IS_ADULT registered) but the query references a
+        // typo'd inverse op. An unresolved evaluator must not match: the inverse
+        // flag applies only to a real result, never to the "unregistered" case.
+        let query = DnfQuery::builder()
+            .with_custom_op(
+                "IS_ADULT",
+                false,
+                |field, _| matches!(field, Value::Int(n) if *n >= 18),
+            )
+            .or(|c| c.and("age", Op::not_custom("IS_ADALT"), Value::None))
             .build();
 
         assert!(!query.evaluate(&user));
