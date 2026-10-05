@@ -1,4 +1,5 @@
 use crate::Value;
+use std::cmp::Ordering;
 use std::fmt;
 
 /// Direction of an ordered comparison.
@@ -244,6 +245,37 @@ impl Op {
 
     // ==================== Type-specific scalar functions ====================
 
+    /// Resolves an ordered comparison, or `None` when the operands are incomparable.
+    ///
+    /// Callers must bail out with `false` on `None` *before* applying `inverse`;
+    /// otherwise `>=` (the inverse of `<`) would hold for operands that have no order.
+    #[inline]
+    fn ordered(cmp: Option<Ordering>, which: &ComparisonOrdering) -> Option<bool> {
+        let want = match which {
+            ComparisonOrdering::Greater => Ordering::Greater,
+            ComparisonOrdering::Less => Ordering::Less,
+        };
+        cmp.map(|ord| ord == want)
+    }
+
+    /// Returns `true` if `value` is a well-formed range operand: a numeric array
+    /// with at least two bounds.
+    ///
+    /// This separates an *inapplicable* BETWEEN operand (a non-array, or a
+    /// non-numeric/too-short array) from a well-formed range that merely clamps
+    /// to *empty* for a given field type (e.g. a negative bound on an unsigned
+    /// field). The former makes BETWEEN false regardless of inversion; the latter
+    /// is a real empty range, so NOT BETWEEN is true.
+    #[inline]
+    fn is_numeric_range(value: &Value) -> bool {
+        match value {
+            Value::IntArray(arr) => arr.len() >= 2,
+            Value::UintArray(arr) => arr.len() >= 2,
+            Value::FloatArray(arr) => arr.len() >= 2,
+            _ => false,
+        }
+    }
+
     /// Extract range bounds from a Value for BETWEEN operator.
     /// Returns (min, max) as f64 for cross-type comparison.
     #[inline]
@@ -262,9 +294,10 @@ impl Op {
         match value {
             Value::IntArray(arr) if arr.len() >= 2 => Some((arr[0], arr[1])),
             Value::UintArray(arr) if arr.len() >= 2 => {
-                // Safe conversion for values that fit in i64
+                // A lower bound above i64::MAX leaves no i64 in range; an upper
+                // bound above it is clamped.
                 let min = i64::try_from(arr[0]).ok()?;
-                let max = i64::try_from(arr[1]).ok()?;
+                let max = i64::try_from(arr[1]).unwrap_or(i64::MAX);
                 Some((min, max))
             }
             Value::FloatArray(arr) if arr.len() >= 2 => {
@@ -281,13 +314,15 @@ impl Op {
         match value {
             Value::UintArray(arr) if arr.len() >= 2 => Some((arr[0], arr[1])),
             Value::IntArray(arr) if arr.len() >= 2 => {
-                // Safe conversion for non-negative values
-                let min = u64::try_from(arr[0]).ok()?;
+                // A negative lower bound is clamped to 0; a negative upper bound
+                // leaves no u64 in range.
+                let min = u64::try_from(arr[0]).unwrap_or(0);
                 let max = u64::try_from(arr[1]).ok()?;
                 Some((min, max))
             }
             Value::FloatArray(arr) if arr.len() >= 2 => {
-                if arr[0] >= 0.0 && arr[1] >= 0.0 {
+                // `as u64` saturates, so a negative lower bound becomes 0.
+                if arr[1] >= 0.0 {
                     Some((arr[0] as u64, arr[1] as u64))
                 } else {
                     None
@@ -302,23 +337,40 @@ impl Op {
     pub(crate) fn scalar_str(&self, field: &str, value: &Value) -> bool {
         let result = match &self.base {
             BaseOperator::Eq => field == value,
-            BaseOperator::Comparison(ord) => match ord {
-                ComparisonOrdering::Greater => field > value,
-                ComparisonOrdering::Less => field < value,
+            BaseOperator::Comparison(ord) => match Self::ordered(field.partial_cmp(value), ord) {
+                Some(r) => r,
+                None => return false,
             },
             BaseOperator::Contains => {
-                let needle = value.to_string_repr();
-                field.contains(needle.as_ref())
+                // If the query value is None, return false (unresolvable reference -> false)
+                if let Value::None = value {
+                    false
+                } else {
+                    let needle = value.to_string_repr();
+                    field.contains(needle.as_ref())
+                }
             }
             BaseOperator::StartsWith => {
-                let prefix = value.to_string_repr();
-                field.starts_with(prefix.as_ref())
+                // If the query value is None, return false (unresolvable reference -> false)
+                if let Value::None = value {
+                    false
+                } else {
+                    let prefix = value.to_string_repr();
+                    field.starts_with(prefix.as_ref())
+                }
             }
             BaseOperator::EndsWith => {
-                let suffix = value.to_string_repr();
-                field.ends_with(suffix.as_ref())
+                // If the query value is None, return false (unresolvable reference -> false)
+                if let Value::None = value {
+                    false
+                } else {
+                    let suffix = value.to_string_repr();
+                    field.ends_with(suffix.as_ref())
+                }
             }
-            BaseOperator::AllOf | BaseOperator::AnyOf | BaseOperator::Between => false,
+            BaseOperator::AnyOf => Self::scalar_str_any_of(field, value),
+            BaseOperator::AllOf => Self::scalar_str_all_of(field, value),
+            BaseOperator::Between => return false,
             BaseOperator::Custom(_) => return false, // Custom ops handled at query level
         };
         self.inverse ^ result
@@ -329,30 +381,52 @@ impl Op {
     pub(crate) fn scalar_int(&self, field: i64, value: &Value) -> bool {
         let result = match &self.base {
             BaseOperator::Eq => field == *value,
-            BaseOperator::Comparison(ord) => match ord {
-                ComparisonOrdering::Greater => field > *value,
-                ComparisonOrdering::Less => field < *value,
+            BaseOperator::Comparison(ord) => match Self::ordered(field.partial_cmp(value), ord) {
+                Some(r) => r,
+                None => return false,
             },
             BaseOperator::Contains => {
-                let needle = value.to_string_repr();
-                field.to_string().contains(needle.as_ref())
-            }
-            BaseOperator::StartsWith => {
-                let prefix = value.to_string_repr();
-                field.to_string().starts_with(prefix.as_ref())
-            }
-            BaseOperator::EndsWith => {
-                let suffix = value.to_string_repr();
-                field.to_string().ends_with(suffix.as_ref())
-            }
-            BaseOperator::Between => {
-                if let Some((min, max)) = Self::extract_range_i64(value) {
-                    field >= min && field <= max
-                } else {
+                // If the query value is None, return false (unresolvable reference -> false)
+                if let Value::None = value {
                     false
+                } else {
+                    let needle = value.to_string_repr();
+                    field.to_string().contains(needle.as_ref())
                 }
             }
-            BaseOperator::AllOf | BaseOperator::AnyOf => false,
+            BaseOperator::StartsWith => {
+                // If the query value is None, return false (unresolvable reference -> false)
+                if let Value::None = value {
+                    false
+                } else {
+                    let prefix = value.to_string_repr();
+                    field.to_string().starts_with(prefix.as_ref())
+                }
+            }
+            BaseOperator::EndsWith => {
+                // If the query value is None, return false (unresolvable reference -> false)
+                if let Value::None = value {
+                    false
+                } else {
+                    let suffix = value.to_string_repr();
+                    field.to_string().ends_with(suffix.as_ref())
+                }
+            }
+            BaseOperator::Between => {
+                // An inapplicable operand (not a range) is false regardless of
+                // inversion; a well-formed range that is empty after clamping
+                // (e.g. a lower bound above `i64::MAX`) yields `false` here, which
+                // the `inverse` xor below turns into `true` for NOT BETWEEN.
+                if !Self::is_numeric_range(value) {
+                    return false;
+                }
+                match Self::extract_range_i64(value) {
+                    Some((min, max)) => field >= min && field <= max,
+                    None => false,
+                }
+            }
+            BaseOperator::AnyOf => Self::scalar_any_of(&field, value),
+            BaseOperator::AllOf => Self::scalar_all_of(&field, value),
             BaseOperator::Custom(_) => return false,
         };
         self.inverse ^ result
@@ -363,30 +437,53 @@ impl Op {
     pub(crate) fn scalar_uint(&self, field: u64, value: &Value) -> bool {
         let result = match &self.base {
             BaseOperator::Eq => field == *value,
-            BaseOperator::Comparison(ord) => match ord {
-                ComparisonOrdering::Greater => field > *value,
-                ComparisonOrdering::Less => field < *value,
+            BaseOperator::Comparison(ord) => match Self::ordered(field.partial_cmp(value), ord) {
+                Some(r) => r,
+                None => return false,
             },
             BaseOperator::Contains => {
-                let needle = value.to_string_repr();
-                field.to_string().contains(needle.as_ref())
-            }
-            BaseOperator::StartsWith => {
-                let prefix = value.to_string_repr();
-                field.to_string().starts_with(prefix.as_ref())
-            }
-            BaseOperator::EndsWith => {
-                let suffix = value.to_string_repr();
-                field.to_string().ends_with(suffix.as_ref())
-            }
-            BaseOperator::Between => {
-                if let Some((min, max)) = Self::extract_range_u64(value) {
-                    field >= min && field <= max
-                } else {
+                // If the query value is None, return false (unresolvable reference -> false)
+                if let Value::None = value {
                     false
+                } else {
+                    let needle = value.to_string_repr();
+                    field.to_string().contains(needle.as_ref())
                 }
             }
-            BaseOperator::AllOf | BaseOperator::AnyOf => false,
+            BaseOperator::StartsWith => {
+                // If the query value is None, return false (unresolvable reference -> false)
+                if let Value::None = value {
+                    false
+                } else {
+                    let prefix = value.to_string_repr();
+                    field.to_string().starts_with(prefix.as_ref())
+                }
+            }
+            BaseOperator::EndsWith => {
+                // If the query value is None, return false (unresolvable reference -> false)
+                if let Value::None = value {
+                    false
+                } else {
+                    let suffix = value.to_string_repr();
+                    field.to_string().ends_with(suffix.as_ref())
+                }
+            }
+            BaseOperator::Between => {
+                // An inapplicable operand (not a range) is false regardless of
+                // inversion; a well-formed range that is empty after clamping
+                // (e.g. a negative upper bound on this unsigned field) yields
+                // `false` here, which the `inverse` xor below turns into `true`
+                // for NOT BETWEEN.
+                if !Self::is_numeric_range(value) {
+                    return false;
+                }
+                match Self::extract_range_u64(value) {
+                    Some((min, max)) => field >= min && field <= max,
+                    None => false,
+                }
+            }
+            BaseOperator::AnyOf => Self::scalar_any_of(&field, value),
+            BaseOperator::AllOf => Self::scalar_all_of(&field, value),
             BaseOperator::Custom(_) => return false,
         };
         self.inverse ^ result
@@ -397,30 +494,51 @@ impl Op {
     pub(crate) fn scalar_float(&self, field: f64, value: &Value) -> bool {
         let result = match &self.base {
             BaseOperator::Eq => field == *value,
-            BaseOperator::Comparison(ord) => match ord {
-                ComparisonOrdering::Greater => field > *value,
-                ComparisonOrdering::Less => field < *value,
+            BaseOperator::Comparison(ord) => match Self::ordered(field.partial_cmp(value), ord) {
+                Some(r) => r,
+                None => return false,
             },
             BaseOperator::Contains => {
-                let needle = value.to_string_repr();
-                field.to_string().contains(needle.as_ref())
-            }
-            BaseOperator::StartsWith => {
-                let prefix = value.to_string_repr();
-                field.to_string().starts_with(prefix.as_ref())
-            }
-            BaseOperator::EndsWith => {
-                let suffix = value.to_string_repr();
-                field.to_string().ends_with(suffix.as_ref())
-            }
-            BaseOperator::Between => {
-                if let Some((min, max)) = Self::extract_range_f64(value) {
-                    field >= min && field <= max
-                } else {
+                // If the query value is None, return false (unresolvable reference -> false)
+                if let Value::None = value {
                     false
+                } else {
+                    let needle = value.to_string_repr();
+                    field.to_string().contains(needle.as_ref())
                 }
             }
-            BaseOperator::AllOf | BaseOperator::AnyOf => false,
+            BaseOperator::StartsWith => {
+                // If the query value is None, return false (unresolvable reference -> false)
+                if let Value::None = value {
+                    false
+                } else {
+                    let prefix = value.to_string_repr();
+                    field.to_string().starts_with(prefix.as_ref())
+                }
+            }
+            BaseOperator::EndsWith => {
+                // If the query value is None, return false (unresolvable reference -> false)
+                if let Value::None = value {
+                    false
+                } else {
+                    let suffix = value.to_string_repr();
+                    field.to_string().ends_with(suffix.as_ref())
+                }
+            }
+            BaseOperator::Between => {
+                // An inapplicable operand (not a range) is false regardless of
+                // inversion. A well-formed numeric range always extracts here, so
+                // the `None` arm is unreachable but kept for symmetry.
+                if !Self::is_numeric_range(value) {
+                    return false;
+                }
+                match Self::extract_range_f64(value) {
+                    Some((min, max)) => field >= min && field <= max,
+                    None => false,
+                }
+            }
+            BaseOperator::AnyOf => Self::scalar_any_of(&field, value),
+            BaseOperator::AllOf => Self::scalar_all_of(&field, value),
             BaseOperator::Custom(_) => return false,
         };
         self.inverse ^ result
@@ -432,16 +550,111 @@ impl Op {
         let result = match &self.base {
             BaseOperator::Eq => field == *value,
             // Bool comparison: true > false
-            BaseOperator::Comparison(ord) => match ord {
-                ComparisonOrdering::Greater => field > *value,
-                ComparisonOrdering::Less => field < *value,
+            BaseOperator::Comparison(ord) => match Self::ordered(field.partial_cmp(value), ord) {
+                Some(r) => r,
+                None => return false,
             },
             // String ops on bool don't make sense
-            BaseOperator::Contains | BaseOperator::StartsWith | BaseOperator::EndsWith => false,
-            BaseOperator::AllOf | BaseOperator::AnyOf | BaseOperator::Between => false,
+            BaseOperator::Contains | BaseOperator::StartsWith | BaseOperator::EndsWith => {
+                return false;
+            }
+            BaseOperator::AnyOf => Self::scalar_any_of(&field, value),
+            BaseOperator::AllOf => Self::scalar_all_of(&field, value),
+            BaseOperator::Between => return false,
             BaseOperator::Custom(_) => return false,
         };
         self.inverse ^ result
+    }
+
+    /// `ANY OF` / `IN` for a string scalar field.
+    ///
+    /// For a `StringSet`, membership is an O(1) `contains` lookup against the
+    /// borrowed field. For a `StringArray`, the field's [`Value`] is built once
+    /// before the scan, so membership is decided without allocating a `Value`
+    /// for every element (the generic [`scalar_any_of`](Self::scalar_any_of)
+    /// would wrap each element in turn). Non-string operands fall back to that
+    /// generic path so cross-type matches (e.g. `"5" IN [5]`) keep working.
+    fn scalar_str_any_of(field: &str, value: &Value) -> bool {
+        match value {
+            Value::StringArray(opts) => {
+                let needle = Value::from(field);
+                opts.iter().any(|s| **s == needle)
+            }
+            Value::StringSet(opts) => opts.contains(field),
+            _ => Self::scalar_any_of(&field, value),
+        }
+    }
+
+    /// `ALL OF` for a string scalar field.
+    ///
+    /// The string-operand mirror of [`scalar_str_any_of`](Self::scalar_str_any_of).
+    /// Set elements are unique, so `ALL OF` can hold only for an empty set
+    /// (vacuously true) or a single element equal to the field — decided with an
+    /// O(1) `contains`. For an array, the field's [`Value`] is built once and
+    /// every element compared against it without per-element allocation.
+    /// Non-string operands fall back to the generic
+    /// [`scalar_all_of`](Self::scalar_all_of).
+    fn scalar_str_all_of(field: &str, value: &Value) -> bool {
+        match value {
+            Value::StringArray(req) => {
+                let needle = Value::from(field);
+                req.iter().all(|s| **s == needle)
+            }
+            Value::StringSet(req) => match req.len() {
+                0 => true,
+                1 => req.contains(field),
+                _ => false,
+            },
+            _ => Self::scalar_all_of(&field, value),
+        }
+    }
+
+    /// Returns `true` if `field` equals any element of the collection `value`.
+    ///
+    /// Backs `ANY OF` / `IN` on a scalar field: the field matches when it is a
+    /// member of the operand array or set. Numeric elements are compared
+    /// cross-type, so an integer field can match a float-array element and vice
+    /// versa. A non-collection operand degrades to an equality check.
+    fn scalar_any_of<T>(field: &T, value: &Value) -> bool
+    where
+        T: PartialEq<Value>,
+    {
+        match value {
+            Value::StringArray(opts) => opts.iter().any(|s| *field == Value::from(s.as_ref())),
+            Value::StringSet(opts) => opts.iter().any(|s| *field == Value::from(s.as_ref())),
+            Value::IntArray(opts) => opts.iter().any(|&x| *field == Value::Int(x)),
+            Value::IntSet(opts) => opts.iter().any(|&x| *field == Value::Int(x)),
+            Value::UintArray(opts) => opts.iter().any(|&x| *field == Value::Uint(x)),
+            Value::UintSet(opts) => opts.iter().any(|&x| *field == Value::Uint(x)),
+            Value::FloatArray(opts) => opts.iter().any(|&x| *field == Value::Float(x)),
+            Value::BoolArray(opts) => opts.iter().any(|&x| *field == Value::Bool(x)),
+            Value::BoolSet(opts) => opts.iter().any(|&x| *field == Value::Bool(x)),
+            other => *field == *other,
+        }
+    }
+
+    /// Returns `true` if `field` equals every element of the collection `value`.
+    ///
+    /// Backs `ALL OF` on a scalar field: a scalar holds a single value, so this
+    /// holds only when every operand element equals the field. An empty operand
+    /// is vacuously `true`, matching the collection `ALL OF`. A non-collection
+    /// operand degrades to an equality check.
+    fn scalar_all_of<T>(field: &T, value: &Value) -> bool
+    where
+        T: PartialEq<Value>,
+    {
+        match value {
+            Value::StringArray(req) => req.iter().all(|s| *field == Value::from(s.as_ref())),
+            Value::StringSet(req) => req.iter().all(|s| *field == Value::from(s.as_ref())),
+            Value::IntArray(req) => req.iter().all(|&x| *field == Value::Int(x)),
+            Value::IntSet(req) => req.iter().all(|&x| *field == Value::Int(x)),
+            Value::UintArray(req) => req.iter().all(|&x| *field == Value::Uint(x)),
+            Value::UintSet(req) => req.iter().all(|&x| *field == Value::Uint(x)),
+            Value::FloatArray(req) => req.iter().all(|&x| *field == Value::Float(x)),
+            Value::BoolArray(req) => req.iter().all(|&x| *field == Value::Bool(x)),
+            Value::BoolSet(req) => req.iter().all(|&x| *field == Value::Bool(x)),
+            other => *field == *other,
+        }
     }
 
     /// Applies the operator to an iterator of field values.
@@ -472,13 +685,18 @@ impl Op {
     {
         let result = match &self.base {
             BaseOperator::Eq => Self::iter_eq(field_iter, query_value),
-            BaseOperator::Comparison(ordering) => Self::iter_cmp(field_iter, query_value, ordering),
+            BaseOperator::Comparison(ordering) => {
+                match Self::iter_cmp(field_iter, query_value, ordering) {
+                    Some(r) => r,
+                    None => return false,
+                }
+            }
             BaseOperator::Contains => field_iter.any(|item| item == query_value),
             BaseOperator::StartsWith => Self::iter_starts_with(field_iter, query_value),
             BaseOperator::EndsWith => Self::iter_ends_with(field_iter, query_value),
             BaseOperator::AllOf => Self::iter_all_of(field_iter, query_value),
             BaseOperator::AnyOf => Self::iter_any_of(field_iter, query_value),
-            BaseOperator::Between => false, // BETWEEN doesn't apply to collections
+            BaseOperator::Between => return false, // BETWEEN doesn't apply to collections
             BaseOperator::Custom(_) => return false,
         };
 
@@ -503,24 +721,20 @@ impl Op {
         }
     }
 
-    /// Comparison operator: use first element for comparison
+    /// Comparison operator: use first element for comparison.
+    ///
+    /// Returns `None` for an empty collection or incomparable operands.
     fn iter_cmp<'a, I, T>(
         mut field_iter: I,
         query_value: &Value,
         ordering: &ComparisonOrdering,
-    ) -> bool
+    ) -> Option<bool>
     where
         I: Iterator<Item = &'a T>,
         T: 'a + PartialEq<Value> + PartialOrd<Value>,
     {
-        if let Some(first) = field_iter.next() {
-            match ordering {
-                ComparisonOrdering::Greater => first > query_value,
-                ComparisonOrdering::Less => first < query_value,
-            }
-        } else {
-            false
-        }
+        let first = field_iter.next()?;
+        Self::ordered(first.partial_cmp(query_value), ordering)
     }
 
     /// StartsWith operator: check if first element equals query_value
@@ -1780,23 +1994,83 @@ mod tests {
     }
 
     #[test]
-    fn test_scalar_operators_return_false_for_collection_ops() {
+    fn test_scalar_float() {
+        // Test that NaN field values never match any comparison (as per SQL semantics)
+        let nan = f64::NAN;
+        let f = &Value::Float(5.0);
+        let cases = vec![
+            // Test all comparison operators with NaN field values - they should always return false
+            Op::LTE,
+            Op::GTE,
+            Op::EQ,
+            Op::GT,
+            Op::LT,
+        ];
+
+        for case in cases {
+            assert!(
+                !case.scalar_float(nan, f),
+                "Failed: {nan} {case} {f} sould be false"
+            );
+        }
+        // Test that regular float comparisons still work
+
+        assert!(
+            Op::EQ.scalar_float(5.0, &Value::Float(5.0)),
+            "5.0 == 5.0 should be true"
+        );
+        assert!(
+            Op::LT.scalar_float(3.0, &Value::Float(5.0)),
+            "3.0 < 5.0 should be true"
+        );
+        assert!(
+            Op::GT.scalar_float(5.0, &Value::Float(3.0)),
+            "5.0 > 3.0 should be true"
+        );
+        assert!(
+            Op::LTE.scalar_float(5.0, &Value::Float(5.0)),
+            "5.0 <= 5.0 should be true"
+        );
+        assert!(
+            Op::GTE.scalar_float(5.0, &Value::Float(5.0)),
+            "5.0 >= 5.0 should be true"
+        );
+
+        // Test NaN with other NaN (should also be false)
+        assert!(
+            !Op::EQ.scalar_float(nan, &Value::Float(f64::NAN)),
+            "NaN field == NaN value should be true"
+        );
+        assert!(
+            !Op::EQ.scalar_float(5.0, &Value::Float(f64::NAN)),
+            "5.0 field == NaN value should be true"
+        );
+    }
+
+    #[test]
+    fn test_collection_field_scalar_eval_returns_false() {
         use crate::DnfField;
 
-        // ALL OF and ANY OF with evaluate() return false for Value types
-        // Use any() for proper collection evaluation
+        // An array/set-typed field evaluated through the *scalar* `evaluate()`
+        // path returns false — collection fields must be evaluated via `any()`.
         let test_cases: Vec<(Op, Value, Value, &str)> = vec![
             (
                 Op::ALL_OF,
-                Value::from(vec![1, 2, 3]),
-                Value::from(vec![2, 3]),
-                "ALL OF on Value",
+                Value::from(vec![1i64, 2, 3]),
+                Value::from(vec![2i64, 3]),
+                "ALL OF on array field",
             ),
             (
                 Op::ANY_OF,
-                Value::Int(5),
-                Value::from(vec![3, 5, 7]),
-                "ANY OF on Value",
+                Value::from(vec![1i64, 2, 3]),
+                Value::from(vec![3i64]),
+                "ANY OF on array field",
+            ),
+            (
+                Op::BETWEEN,
+                Value::from(vec![1i64, 2, 3]),
+                Value::from(vec![1i64, 5]),
+                "BETWEEN on array field",
             ),
         ];
 
@@ -1806,6 +2080,185 @@ mod tests {
                 "Failed: {} should return false",
                 desc
             );
+        }
+    }
+
+    #[test]
+    fn test_scalar_membership_any_of_all_of() {
+        use crate::DnfField;
+
+        // `ANY OF` / `IN` on a scalar field is membership; `ALL OF` holds only
+        // when every element equals the field. `NOT` variants invert the result.
+        // Covers every scalar type, cross-type numerics, floats (which the
+        // collection path omits), empty operands, and non-membership.
+        let cases: Vec<(Value, Op, Value, bool, &str)> = vec![
+            // ANY OF / IN membership.
+            (
+                Value::from("active"),
+                Op::ANY_OF,
+                Value::from(vec!["active", "pending"]),
+                true,
+                "string member",
+            ),
+            (
+                Value::from("deleted"),
+                Op::ANY_OF,
+                Value::from(vec!["active", "pending"]),
+                false,
+                "string non-member",
+            ),
+            (
+                Value::Int(5),
+                Op::ANY_OF,
+                Value::from(vec![3i64, 5, 7]),
+                true,
+                "int member",
+            ),
+            (
+                Value::Uint(5),
+                Op::ANY_OF,
+                Value::from(vec![3i64, 5, 7]),
+                true,
+                "uint member cross-type (IntArray)",
+            ),
+            (
+                Value::Float(2.5),
+                Op::ANY_OF,
+                Value::from(vec![1.5f64, 2.5]),
+                true,
+                "float member (collection path omits FloatArray)",
+            ),
+            (
+                Value::Bool(true),
+                Op::ANY_OF,
+                Value::from(vec![true, false]),
+                true,
+                "bool member",
+            ),
+            (
+                Value::Int(5),
+                Op::ANY_OF,
+                Value::from(Vec::<i64>::new()),
+                false,
+                "empty operand is never a member",
+            ),
+            // NOT IN inverts membership (and is true for a non-member).
+            (
+                Value::Int(5),
+                Op::NOT_ANY_OF,
+                Value::from(vec![3i64, 5, 7]),
+                false,
+                "NOT IN member",
+            ),
+            (
+                Value::Int(4),
+                Op::NOT_ANY_OF,
+                Value::from(vec![3i64, 5, 7]),
+                true,
+                "NOT IN non-member",
+            ),
+            // ALL OF: field must equal every element.
+            (
+                Value::Int(5),
+                Op::ALL_OF,
+                Value::from(vec![5i64, 5]),
+                true,
+                "ALL OF all-equal",
+            ),
+            (
+                Value::Int(5),
+                Op::ALL_OF,
+                Value::from(vec![5i64, 6]),
+                false,
+                "ALL OF mixed",
+            ),
+            (
+                Value::Int(5),
+                Op::ALL_OF,
+                Value::from(Vec::<i64>::new()),
+                true,
+                "ALL OF empty is vacuously true",
+            ),
+            // String field membership against a `StringSet` operand (the
+            // allocation-free scalar string path).
+            (
+                Value::from("active"),
+                Op::ANY_OF,
+                Value::string_set(["active", "pending"]),
+                true,
+                "string member (StringSet)",
+            ),
+            (
+                Value::from("deleted"),
+                Op::ANY_OF,
+                Value::string_set(["active", "pending"]),
+                false,
+                "string non-member (StringSet)",
+            ),
+            (
+                Value::from("banned"),
+                Op::NOT_ANY_OF,
+                Value::from(vec!["banned", "deleted"]),
+                false,
+                "string NOT IN a listed value",
+            ),
+            (
+                Value::from("alice"),
+                Op::NOT_ANY_OF,
+                Value::from(vec!["banned", "deleted"]),
+                true,
+                "string NOT IN an unlisted value",
+            ),
+            // String `ALL OF`: a scalar holds one value, so it matches only when
+            // every element is that same string.
+            (
+                Value::from("active"),
+                Op::ALL_OF,
+                Value::from(vec!["active", "active"]),
+                true,
+                "string ALL OF all-equal (StringArray)",
+            ),
+            (
+                Value::from("active"),
+                Op::ALL_OF,
+                Value::from(vec!["active", "pending"]),
+                false,
+                "string ALL OF mixed",
+            ),
+            (
+                Value::from("active"),
+                Op::ALL_OF,
+                Value::string_set(["active"]),
+                true,
+                "string ALL OF single-element (StringSet)",
+            ),
+            (
+                Value::from("active"),
+                Op::ALL_OF,
+                Value::from(Vec::<&str>::new()),
+                true,
+                "string ALL OF empty is vacuously true",
+            ),
+            // Cross-type: a string field against a non-string operand still
+            // resolves through the generic fallback.
+            (
+                Value::from("5"),
+                Op::ANY_OF,
+                Value::from(vec![3i64, 5, 7]),
+                true,
+                "string field cross-type member (IntArray)",
+            ),
+            (
+                Value::from("9"),
+                Op::ANY_OF,
+                Value::from(vec![3i64, 5, 7]),
+                false,
+                "string field cross-type non-member (IntArray)",
+            ),
+        ];
+
+        for (field, op, query, expected, desc) in cases {
+            assert_eq!(field.evaluate(&op, &query), expected, "Failed: {}", desc);
         }
     }
 
@@ -1881,5 +2334,158 @@ mod tests {
         for (op, query, expected, desc) in collection_tests {
             assert_eq!(op.any(field.iter(), &query), expected, "Failed: {}", desc);
         }
+    }
+
+    #[test]
+    fn test_inverse_ordered_ops_false_when_incomparable() {
+        let empty: Vec<i64> = vec![];
+        let single = [5_i64];
+        let cases: Vec<(bool, &str)> = vec![
+            (
+                Op::GTE.any(empty.iter(), &Value::Int(4)),
+                "empty collection >= 4",
+            ),
+            (
+                Op::LTE.any(empty.iter(), &Value::Int(0)),
+                "empty collection <= 0",
+            ),
+            (
+                Op::NOT_BETWEEN.any(single.iter(), &Value::from(vec![1_i64, 10])),
+                "NOT BETWEEN on collection",
+            ),
+            (
+                Op::GTE.scalar_int(5, &Value::from("abc")),
+                "int >= non-numeric string",
+            ),
+            (Op::LTE.scalar_int(5, &Value::Bool(true)), "int <= bool"),
+            (Op::GTE.scalar_uint(5, &Value::Bool(true)), "uint >= bool"),
+            (
+                Op::LTE.scalar_float(5.0, &Value::Bool(true)),
+                "float <= bool",
+            ),
+            (
+                Op::GTE.scalar_float(f64::NAN, &Value::Float(1.0)),
+                "NaN >= 1.0",
+            ),
+            (Op::GTE.scalar_bool(true, &Value::Int(1)), "bool >= int"),
+            (
+                Op::NOT_BETWEEN.scalar_int(5, &Value::Int(1)),
+                "NOT BETWEEN, non-range operand",
+            ),
+            (
+                Op::NOT_BETWEEN.scalar_str("5", &Value::from(vec![1_i64, 10])),
+                "NOT BETWEEN on str",
+            ),
+            (
+                Op::NOT_CONTAINS.scalar_bool(true, &Value::from("t")),
+                "NOT CONTAINS on bool",
+            ),
+        ];
+        for (actual, desc) in cases {
+            assert!(!actual, "Failed: {}", desc);
+        }
+    }
+
+    #[test]
+    fn test_between_empty_range_clamps_and_inverts() {
+        // A negative bound clamps against a field's type rather than making the
+        // whole range silently unsatisfiable. `0` (the clamped lower bound, and
+        // the min of every unsigned type) is the key corner case.
+        //
+        // (result, expected, description)
+        let int_range = Value::from(vec![-5_i64, 10]);
+        let empty_range = Value::from(vec![-10_i64, -5]); // no unsigned value fits
+        let upper_zero = Value::from(vec![-5_i64, 0]); // collapses to {0}
+        let cases: Vec<(bool, bool, &str)> = vec![
+            // Negative lower bound clamps to 0; 0 is included.
+            (Op::BETWEEN.scalar_uint(0, &int_range), true, "0 in [-5,10]"),
+            (
+                Op::NOT_BETWEEN.scalar_uint(0, &int_range),
+                false,
+                "0 not-outside [-5,10]",
+            ),
+            // Upper bound of exactly 0: only 0 matches.
+            (Op::BETWEEN.scalar_uint(0, &upper_zero), true, "0 in [-5,0]"),
+            (
+                Op::BETWEEN.scalar_uint(1, &upper_zero),
+                false,
+                "1 not in [-5,0]",
+            ),
+            // Empty range (negative upper bound) on an unsigned field: BETWEEN is
+            // false, and NOT BETWEEN inverts to true — unlike an inapplicable
+            // operand, which is false either way.
+            (
+                Op::BETWEEN.scalar_uint(0, &empty_range),
+                false,
+                "0 in empty range",
+            ),
+            (
+                Op::NOT_BETWEEN.scalar_uint(0, &empty_range),
+                true,
+                "0 outside empty range",
+            ),
+            // A signed field evaluates the identical query the same way: 0 is not
+            // in [-10,-5], so NOT BETWEEN is true. (Regression: these diverged.)
+            (
+                Op::BETWEEN.scalar_int(0, &empty_range),
+                false,
+                "i64: 0 in [-10,-5]",
+            ),
+            (
+                Op::NOT_BETWEEN.scalar_int(0, &empty_range),
+                true,
+                "i64: 0 outside [-10,-5]",
+            ),
+        ];
+        for (actual, expected, desc) in cases {
+            assert_eq!(actual, expected, "Failed: {desc}");
+        }
+    }
+
+    #[test]
+    fn test_none_value_string_operators() {
+        // Tests that demonstrate the fix:
+        // When a field is None (Value::None), CONTAINS/STARTS_WITH/ENDS_WITH
+        // should evaluate to false, not true.
+
+        use crate::field::DnfField;
+
+        let none_value = Value::None;
+        // TODO: rework into datadriven test
+        //
+        // These should all be false (unresolvable reference -> false)
+        assert!(!none_value.evaluate(&Op::CONTAINS, &Value::from("test")));
+        assert!(!none_value.evaluate(&Op::STARTS_WITH, &Value::from("test")));
+        assert!(!none_value.evaluate(&Op::ENDS_WITH, &Value::from("test")));
+
+        // Same test with inverted operators - they should also be false
+        assert!(!none_value.evaluate(&Op::NOT_CONTAINS, &Value::from("test")));
+        assert!(!none_value.evaluate(&Op::NOT_STARTS_WITH, &Value::from("test")));
+        assert!(!none_value.evaluate(&Op::NOT_ENDS_WITH, &Value::from("test")));
+    }
+
+    #[test]
+    fn test_none_value_string_operators_comprehensive() {
+        // Comprehensive tests for None values with various string operators
+        use crate::field::DnfField;
+
+        // TODO: rework into datadriven test
+        let none_value = Value::None;
+        let test_string = "test";
+
+        // Test all string operators return false when field is None
+        assert!(!none_value.evaluate(&Op::CONTAINS, &Value::from(test_string)));
+        assert!(!none_value.evaluate(&Op::STARTS_WITH, &Value::from(test_string)));
+        assert!(!none_value.evaluate(&Op::ENDS_WITH, &Value::from(test_string)));
+
+        // Test with numeric values - should also return false
+        assert!(!none_value.evaluate(&Op::CONTAINS, &Value::from(42i64)));
+        assert!(!none_value.evaluate(&Op::STARTS_WITH, &Value::from(42i64)));
+        assert!(!none_value.evaluate(&Op::ENDS_WITH, &Value::from(42i64)));
+
+        // Test with boolean values - should also return false
+        assert!(!none_value.evaluate(&Op::CONTAINS, &Value::from(true)));
+        assert!(!none_value.evaluate(&Op::STARTS_WITH, &Value::from(true)));
+        assert!(!none_value.evaluate(&Op::ENDS_WITH, &Value::from(true)));
     }
 }

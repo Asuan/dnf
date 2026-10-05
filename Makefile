@@ -59,7 +59,7 @@ fmt-fix:
 # (mirror of .github/workflows/ci.yml)
 
 test:
-	$(CARGO) test --workspace --all-features
+	$(CARGO) test -q --workspace --all-features
 
 test-all: test features
 
@@ -67,19 +67,19 @@ test-all: test features
 features: feat-default feat-none feat-serde feat-derive feat-parser-derive
 
 feat-default:
-	$(CARGO) test --workspace
+	$(CARGO) test -q --workspace
 
 feat-none:
-	$(CARGO) test --workspace --no-default-features
+	$(CARGO) test -q --workspace --no-default-features
 
 feat-serde:
-	$(CARGO) test --workspace --no-default-features --features serde
+	$(CARGO) test -q --workspace --no-default-features --features serde
 
 feat-derive:
-	$(CARGO) test --workspace --no-default-features --features derive
+	$(CARGO) test -q --workspace --no-default-features --features derive
 
 feat-parser-derive:
-	$(CARGO) test --workspace --no-default-features --features "parser,derive"
+	$(CARGO) test -q --workspace --no-default-features --features "parser,derive"
 
 # Coverage target (mirror of ci.yml linux-x64 step). Requires cargo-llvm-cov.
 coverage:

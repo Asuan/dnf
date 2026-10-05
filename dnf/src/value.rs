@@ -427,6 +427,8 @@ impl PartialEq<Value> for str {
     fn eq(&self, other: &Value) -> bool {
         match other {
             Value::String(s) => self == s.as_ref(),
+            // `null` is not the empty string, even though it renders as `""`.
+            Value::None => false,
             _ => self == other.to_string_repr().as_ref(),
         }
     }
@@ -595,6 +597,8 @@ impl PartialEq for Value {
             (Value::Float(a), Value::Int(b)) => (a - *b as f64).abs() < f64::EPSILON,
             (Value::Uint(a), Value::Float(b)) => (*a as f64 - b).abs() < f64::EPSILON,
             (Value::Float(a), Value::Uint(b)) => (a - *b as f64).abs() < f64::EPSILON,
+            // `null` never equals a string, including the empty string
+            (Value::String(_), Value::None) | (Value::None, Value::String(_)) => false,
             // String to non-string comparisons - convert both to string
             (Value::String(a), other) => a.as_ref() == other.to_string_repr(),
             (other, Value::String(b)) => other.to_string_repr() == b.as_ref(),

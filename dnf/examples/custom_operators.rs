@@ -151,27 +151,26 @@ fn main() {
             .build();
         assert!(q.evaluate(&student));
 
-        // Parse: score BETWEEN [70, 90] (custom operator with value parameter)
+        // Parse: score MIN_SCORE 70 (custom operator with a scalar value parameter)
+        let min_score = |field: &Value, query_value: &Value| {
+            let (Value::Int(n), Value::Uint(threshold)) = (field, query_value) else {
+                return false;
+            };
+            *n >= *threshold as i64
+        };
         let q = DnfQuery::builder()
-            .with_custom_op("BETWEEN", false, |field, query_value| {
-                let Value::IntArray(range) = query_value else {
-                    return false;
-                };
-                if range.len() < 2 {
-                    return false;
-                }
-                match field {
-                    Value::Int(n) => *n >= range[0] && *n <= range[1],
-                    Value::Uint(n) => {
-                        let n = *n as i64;
-                        n >= range[0] && n <= range[1]
-                    }
-                    _ => false,
-                }
-            })
-            .parse::<Student>("score BETWEEN [70, 90]")
+            .with_custom_op("MIN_SCORE", false, min_score)
+            .parse::<Student>("score MIN_SCORE 70")
             .unwrap()
             .build();
-        assert!(q.evaluate(&student));
+        assert!(q.evaluate(&student)); // 85 >= 70
+
+        // Parse: score NOT MIN_SCORE 90 (negated custom operator from text)
+        let q = DnfQuery::builder()
+            .with_custom_op("MIN_SCORE", false, min_score)
+            .parse::<Student>("score NOT MIN_SCORE 90")
+            .unwrap()
+            .build();
+        assert!(q.evaluate(&student)); // NOT (85 >= 90)
     }
 }

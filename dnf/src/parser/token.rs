@@ -9,25 +9,26 @@ pub(crate) enum Token {
     Or,
 
     // Operators
-    Eq,                 // == or =
-    Ne,                 // !=
-    Gt,                 // >
-    Lt,                 // <
-    Gte,                // >=
-    Lte,                // <=
-    Contains,           // CONTAINS
-    NotContains,        // NOT CONTAINS
-    StartsWith,         // STARTS WITH
-    EndsWith,           // ENDS WITH
-    NotStartsWith,      // NOT STARTS WITH
-    NotEndsWith,        // NOT ENDS WITH
-    AllOf,              // ALL OF
-    AnyOf,              // IN (value in array)
-    NotAllOf,           // NOT ALL OF
-    NotAnyOf,           // NOT IN (value not in array)
-    Between,            // BETWEEN [min, max]
-    NotBetween,         // NOT BETWEEN [min, max]
-    CustomOp(Box<str>), // Custom operator (e.g., IS_ADULT)
+    Eq,                    // == or =
+    Ne,                    // !=
+    Gt,                    // >
+    Lt,                    // <
+    Gte,                   // >=
+    Lte,                   // <=
+    Contains,              // CONTAINS
+    NotContains,           // NOT CONTAINS
+    StartsWith,            // STARTS WITH
+    EndsWith,              // ENDS WITH
+    NotStartsWith,         // NOT STARTS WITH
+    NotEndsWith,           // NOT ENDS WITH
+    AllOf,                 // ALL OF
+    AnyOf,                 // IN (value in array)
+    NotAllOf,              // NOT ALL OF
+    NotAnyOf,              // NOT IN (value not in array)
+    Between,               // BETWEEN [min, max]
+    NotBetween,            // NOT BETWEEN [min, max]
+    CustomOp(Box<str>),    // Custom operator (e.g., IS_ADULT)
+    NotCustomOp(Box<str>), // NOT <custom operator> (e.g., NOT IS_ADULT)
 
     // Values
     String(Box<str>),
@@ -75,6 +76,7 @@ impl std::fmt::Display for Token {
             Token::Between => write!(f, "BETWEEN"),
             Token::NotBetween => write!(f, "NOT BETWEEN"),
             Token::CustomOp(name) => write!(f, "{}", name),
+            Token::NotCustomOp(name) => write!(f, "NOT {}", name),
             Token::String(s) => write!(f, "string '{}'", s),
             Token::Number(n) => write!(f, "number '{}'", n),
             Token::Boolean(b) => write!(f, "boolean {}", b),
@@ -104,12 +106,11 @@ fn skip_whitespace(chars: &mut CharStream<'_>) {
     }
 }
 
-/// Skips whitespace and consumes an identifier.
-///
-/// Returns the start position (or `fallback_pos` at end of input) and the identifier.
-fn read_keyword(chars: &mut CharStream<'_>, fallback_pos: usize) -> (usize, String) {
-    skip_whitespace(chars);
-    let start = chars.peek().map(|(p, _)| *p).unwrap_or(fallback_pos);
+/// Sigil that introduces a map target: `.@keys`, `.@values`.
+const MAP_SIGIL: char = '@';
+
+/// Consumes a run of word characters (alphanumerics and `_`).
+fn read_word(chars: &mut CharStream<'_>) -> String {
     let mut word = String::new();
     while let Some(&(_, ch)) = chars.peek() {
         if ch.is_alphanumeric() || ch == '_' {
@@ -119,7 +120,26 @@ fn read_keyword(chars: &mut CharStream<'_>, fallback_pos: usize) -> (usize, Stri
             break;
         }
     }
-    (start, word)
+    word
+}
+
+/// Returns `true` if the stream is positioned at a `.` that starts a map
+/// target (`.@keys`, `.@values`) rather than a nested field separator.
+fn at_map_target(chars: &CharStream<'_>) -> bool {
+    let mut ahead = chars.clone();
+    matches!(
+        (ahead.next(), ahead.next()),
+        (Some((_, '.')), Some((_, MAP_SIGIL)))
+    )
+}
+
+/// Skips whitespace and consumes an identifier.
+///
+/// Returns the start position (or `fallback_pos` at end of input) and the identifier.
+fn read_keyword(chars: &mut CharStream<'_>, fallback_pos: usize) -> (usize, String) {
+    skip_whitespace(chars);
+    let start = chars.peek().map(|(p, _)| *p).unwrap_or(fallback_pos);
+    (start, read_word(chars))
 }
 
 /// Skips whitespace and verifies the next identifier matches `expected`.
@@ -148,7 +168,15 @@ fn expect_keyword(
     }
 }
 
-/// Tokenize a query string into a vector of tokens.
+/// Returns `true` if `name` is one of the registered custom operator names.
+fn is_custom_op_name(custom_op_names: Option<&[String]>, name: &str) -> bool {
+    custom_op_names.is_some_and(|ops| ops.iter().any(|op| op == name))
+}
+
+/// Tokenize a query string into a vector of tokens paired with byte spans.
+///
+/// Each token carries the `start..end` byte range it occupies in `input`, so
+/// the parser can report accurate positions in its errors.
 ///
 /// # Arguments
 ///
@@ -157,12 +185,18 @@ fn expect_keyword(
 pub(crate) fn tokenize(
     input: &str,
     custom_op_names: Option<&[String]>,
-) -> Result<Vec<Token>, DnfError> {
-    let input_string = input.to_string();
-    let mut tokens = Vec::new();
+) -> Result<Vec<(Token, std::ops::Range<usize>)>, DnfError> {
+    // `input` is only materialized into an owned `String` on the cold error
+    // paths below, so a successful tokenize never clones the whole input.
+    let mut tokens: Vec<Token> = Vec::new();
+    let mut spans: Vec<std::ops::Range<usize>> = Vec::new();
     let mut chars = input.char_indices().peekable();
 
     while let Some((pos, ch)) = chars.next() {
+        // Each iteration below pushes at most one token; whitespace `continue`s
+        // and error arms `return`. The span is `start..(next unconsumed byte)`.
+        let start = pos;
+        let len_before = tokens.len();
         match ch {
             // Skip whitespace
             ' ' | '\t' | '\n' | '\r' => continue,
@@ -192,7 +226,7 @@ pub(crate) fn tokenize(
                         expected: "!=".to_string(),
                         found: "!".to_string(),
                         position: pos,
-                        input: input_string.clone(),
+                        input: input.to_string(),
                     });
                 }
             }
@@ -215,19 +249,11 @@ pub(crate) fn tokenize(
 
             // Map target syntax: .@keys, .@values
             '.' => {
-                if chars.peek().map(|(_, c)| *c) == Some('@') {
-                    chars.next(); // consume '@'
+                if chars.peek().map(|(_, c)| *c) == Some(MAP_SIGIL) {
+                    chars.next(); // consume the sigil
 
                     // Read the target name
-                    let mut target = String::new();
-                    while let Some(&(_, ch)) = chars.peek() {
-                        if ch.is_alphanumeric() || ch == '_' {
-                            target.push(ch);
-                            chars.next();
-                        } else {
-                            break;
-                        }
-                    }
+                    let target = read_word(&mut chars);
 
                     match target.as_str() {
                         "keys" => tokens.push(Token::MapKeys),
@@ -237,7 +263,7 @@ pub(crate) fn tokenize(
                                 expected: "@keys or @values".to_string(),
                                 found: format!("@{}", target),
                                 position: pos,
-                                input: input_string.clone(),
+                                input: input.to_string(),
                             });
                         }
                     }
@@ -246,7 +272,7 @@ pub(crate) fn tokenize(
                         expected: "identifier or @".to_string(),
                         found: ".".to_string(),
                         position: pos,
-                        input: input_string.clone(),
+                        input: input.to_string(),
                     });
                 }
             }
@@ -272,7 +298,7 @@ pub(crate) fn tokenize(
                                 return Err(DnfError::InvalidEscape {
                                     escape: format!("\\{}", ch),
                                     position: escape_pos,
-                                    input: input_string.clone(),
+                                    input: input.to_string(),
                                 });
                             }
                         }
@@ -292,51 +318,118 @@ pub(crate) fn tokenize(
                 if !found_closing_quote {
                     return Err(DnfError::UnterminatedString {
                         position: pos,
-                        input: input_string.clone(),
+                        input: input.to_string(),
                     });
                 }
             }
 
-            // Numbers
+            // Numbers: `-?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?`. A leading `+` is
+            // rejected; `-` must precede a digit.
             '0'..='9' | '+' | '-' => {
+                // A leading `+` is not part of the number grammar.
+                if ch == '+' {
+                    return Err(DnfError::InvalidNumber {
+                        value: ch.to_string(),
+                        position: pos,
+                        input: input.to_string(),
+                    });
+                }
+
                 let mut number = String::new();
                 number.push(ch);
 
-                // Only allow + or - at the start
-                let is_sign = ch == '+' || ch == '-';
-                if is_sign {
-                    // Must be followed by a digit
-                    if !chars
+                // A leading `-` must be followed by a digit.
+                if ch == '-'
+                    && !chars
                         .peek()
                         .map(|(_, c)| c.is_ascii_digit())
                         .unwrap_or(false)
-                    {
-                        return Err(DnfError::InvalidNumber {
-                            value: number,
-                            position: pos,
-                            input: input_string.clone(),
-                        });
-                    }
+                {
+                    return Err(DnfError::InvalidNumber {
+                        value: number,
+                        position: pos,
+                        input: input.to_string(),
+                    });
                 }
 
-                let mut seen_dot = number.contains('.');
-                while let Some(&(dot_pos, ch)) = chars.peek() {
-                    if ch.is_ascii_digit() {
-                        number.push(ch);
+                // Integer and optional fraction digits.
+                let mut seen_dot = false;
+                while let Some(&(dot_pos, c)) = chars.peek() {
+                    if c.is_ascii_digit() {
+                        number.push(c);
                         chars.next();
-                    } else if ch == '.' {
+                    } else if c == '.' {
                         if seen_dot {
                             return Err(DnfError::InvalidNumber {
                                 value: number,
                                 position: dot_pos,
-                                input: input_string.clone(),
+                                input: input.to_string(),
                             });
                         }
                         seen_dot = true;
-                        number.push(ch);
+                        number.push(c);
                         chars.next();
+                        // A `.` must be followed by at least one digit (`1.`).
+                        if !chars
+                            .peek()
+                            .map(|(_, d)| d.is_ascii_digit())
+                            .unwrap_or(false)
+                        {
+                            return Err(DnfError::InvalidNumber {
+                                value: number,
+                                position: dot_pos,
+                                input: input.to_string(),
+                            });
+                        }
                     } else {
                         break;
+                    }
+                }
+
+                // Optional exponent: `[eE][+-]?[0-9]+`.
+                if let Some(&(e_pos, e)) = chars.peek() {
+                    if e == 'e' || e == 'E' {
+                        number.push(e);
+                        chars.next();
+                        // Optional exponent sign.
+                        if let Some(&(_, sign)) = chars.peek() {
+                            if sign == '+' || sign == '-' {
+                                number.push(sign);
+                                chars.next();
+                            }
+                        }
+                        // At least one exponent digit is required.
+                        if !chars
+                            .peek()
+                            .map(|(_, d)| d.is_ascii_digit())
+                            .unwrap_or(false)
+                        {
+                            return Err(DnfError::InvalidNumber {
+                                value: number,
+                                position: e_pos,
+                                input: input.to_string(),
+                            });
+                        }
+                        while let Some(&(_, d)) = chars.peek() {
+                            if d.is_ascii_digit() {
+                                number.push(d);
+                                chars.next();
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // A number cannot run directly into identifier characters
+                // (`18abc`), which would otherwise lex as a separate identifier.
+                if let Some(&(id_pos, c)) = chars.peek() {
+                    if c.is_ascii_alphabetic() || c == '_' {
+                        return Err(DnfError::InvalidNumber {
+                            value: number,
+                            position: id_pos,
+                            input: input.to_string(),
+                        });
                     }
                 }
 
@@ -348,25 +441,16 @@ pub(crate) fn tokenize(
                 let mut ident = String::new();
                 ident.push(ch);
 
-                while let Some(&(_, ch)) = chars.peek() {
-                    // Check for map target syntax: .@keys, .@values
-                    if ch == '.' {
-                        // Peek ahead to check for @
-                        let mut peek_iter = chars.clone();
-                        peek_iter.next(); // consume the '.'
-                        if let Some(&(_, '@')) = peek_iter.peek() {
-                            // This is a map target, stop identifier here
-                            break;
-                        }
-                        // Regular nested field, continue
-                        ident.push(ch);
-                        chars.next();
-                    } else if ch.is_alphanumeric() || ch == '_' {
-                        ident.push(ch);
-                        chars.next();
-                    } else {
+                loop {
+                    ident.push_str(&read_word(&mut chars));
+                    // A `.` continues a nested field unless it starts a map target.
+                    let is_nested_sep =
+                        matches!(chars.peek(), Some(&(_, '.'))) && !at_map_target(&chars);
+                    if !is_nested_sep {
                         break;
                     }
+                    ident.push('.');
+                    chars.next();
                 }
 
                 // Check for keywords (case-sensitive)
@@ -378,6 +462,14 @@ pub(crate) fn tokenize(
                     "true" => tokens.push(Token::Boolean(true)),
                     "false" => tokens.push(Token::Boolean(false)),
                     "null" => tokens.push(Token::Null),
+                    // A registered custom operator takes precedence over the
+                    // built-in operator keywords below, so custom ops whose
+                    // names collide with a keyword (e.g. `BETWEEN`) survive the
+                    // text syntax. Structural tokens (`AND`/`OR`) and value
+                    // literals (`true`/`false`/`null`) above are never shadowed.
+                    _ if is_custom_op_name(custom_op_names, &ident) => {
+                        tokens.push(Token::CustomOp(ident.into_boxed_str()));
+                    }
                     "CONTAINS" => tokens.push(Token::Contains),
                     "IN" => tokens.push(Token::AnyOf), // IN is alias for ANY OF
                     "BETWEEN" => tokens.push(Token::Between),
@@ -390,7 +482,7 @@ pub(crate) fn tokenize(
                                         .to_string(),
                                 found: "end of expression".to_string(),
                                 position: next_word_pos,
-                                input: input_string.clone(),
+                                input: input.to_string(),
                             });
                         }
                         match next_word.as_str() {
@@ -402,7 +494,7 @@ pub(crate) fn tokenize(
                                     &mut chars,
                                     "WITH",
                                     pos,
-                                    &input_string,
+                                    input,
                                     "WITH (after NOT STARTS)",
                                 )?;
                                 tokens.push(Token::NotStartsWith);
@@ -412,22 +504,21 @@ pub(crate) fn tokenize(
                                     &mut chars,
                                     "WITH",
                                     pos,
-                                    &input_string,
+                                    input,
                                     "WITH (after NOT ENDS)",
                                 )?;
                                 tokens.push(Token::NotEndsWith);
                             }
                             "ALL" => {
-                                expect_keyword(
-                                    &mut chars,
-                                    "OF",
-                                    pos,
-                                    &input_string,
-                                    "OF (after NOT ALL)",
-                                )?;
+                                expect_keyword(&mut chars, "OF", pos, input, "OF (after NOT ALL)")?;
                                 tokens.push(Token::NotAllOf);
                             }
                             // "NOT ANY" is not supported - use "NOT IN" instead
+                            // A registered custom operator may follow NOT, e.g.
+                            // `age NOT IS_ADULT`, yielding a negated custom op.
+                            _ if is_custom_op_name(custom_op_names, &next_word) => {
+                                tokens.push(Token::NotCustomOp(next_word.into_boxed_str()));
+                            }
                             _ => {
                                 return Err(DnfError::UnexpectedToken {
                                     expected:
@@ -435,50 +526,26 @@ pub(crate) fn tokenize(
                                             .to_string(),
                                     found: next_word,
                                     position: next_word_pos,
-                                    input: input_string.clone(),
+                                    input: input.to_string(),
                                 });
                             }
                         }
                     }
                     "STARTS" => {
-                        expect_keyword(
-                            &mut chars,
-                            "WITH",
-                            pos,
-                            &input_string,
-                            "WITH (after STARTS)",
-                        )?;
+                        expect_keyword(&mut chars, "WITH", pos, input, "WITH (after STARTS)")?;
                         tokens.push(Token::StartsWith);
                     }
                     "ENDS" => {
-                        expect_keyword(
-                            &mut chars,
-                            "WITH",
-                            pos,
-                            &input_string,
-                            "WITH (after ENDS)",
-                        )?;
+                        expect_keyword(&mut chars, "WITH", pos, input, "WITH (after ENDS)")?;
                         tokens.push(Token::EndsWith);
                     }
                     "ALL" => {
-                        expect_keyword(&mut chars, "OF", pos, &input_string, "OF (after ALL)")?;
+                        expect_keyword(&mut chars, "OF", pos, input, "OF (after ALL)")?;
                         tokens.push(Token::AllOf);
                     }
                     // "ANY" is not supported - use "IN" instead
                     // ANY OF has been replaced by IN operator
-                    _ => {
-                        // Check if this is a custom operator
-                        if let Some(custom_ops) = custom_op_names {
-                            // Case-sensitive match for custom operators
-                            if custom_ops.iter().any(|op| op == &ident) {
-                                tokens.push(Token::CustomOp(ident.into_boxed_str()));
-                            } else {
-                                tokens.push(Token::Identifier(ident.into_boxed_str()));
-                            }
-                        } else {
-                            tokens.push(Token::Identifier(ident.into_boxed_str()));
-                        }
-                    }
+                    _ => tokens.push(Token::Identifier(ident.into_boxed_str())),
                 }
             }
 
@@ -487,18 +554,125 @@ pub(crate) fn tokenize(
                     expected: "valid token".to_string(),
                     found: ch.to_string(),
                     position: pos,
-                    input: input_string.clone(),
+                    input: input.to_string(),
                 });
             }
         }
+
+        // Record the span of the token pushed by this iteration.
+        if tokens.len() > len_before {
+            let end = chars.peek().map(|(p, _)| *p).unwrap_or(input.len());
+            spans.push(start..end);
+        }
     }
 
-    Ok(tokens)
+    Ok(tokens.into_iter().zip(spans).collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tokenizes `input`, discarding spans, for tests that assert only on the
+    /// token sequence.
+    fn lex(input: &str) -> Result<Vec<Token>, DnfError> {
+        tokenize(input, None).map(|toks| toks.into_iter().map(|(t, _)| t).collect())
+    }
+
+    /// Tokenizes `input` with `names` registered as custom operators,
+    /// discarding spans.
+    fn lex_custom(input: &str, names: &[&str]) -> Result<Vec<Token>, DnfError> {
+        let names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+        tokenize(input, Some(&names)).map(|toks| toks.into_iter().map(|(t, _)| t).collect())
+    }
+
+    #[test]
+    fn test_tokenize_custom_op_precedence() {
+        let cases = vec![
+            // (input, custom names, expected tokens, description)
+            (
+                "score BETWEEN 5",
+                vec!["BETWEEN"],
+                vec![
+                    Token::Identifier("score".into()),
+                    Token::CustomOp("BETWEEN".into()),
+                    Token::Number("5".into()),
+                ],
+                "registered name shadows the built-in operator keyword",
+            ),
+            (
+                "score BETWEEN [1, 2]",
+                vec![],
+                vec![
+                    Token::Identifier("score".into()),
+                    Token::Between,
+                    Token::LeftBracket,
+                    Token::Number("1".into()),
+                    Token::Comma,
+                    Token::Number("2".into()),
+                    Token::RightBracket,
+                ],
+                "built-in keyword wins when no custom op is registered",
+            ),
+            (
+                "age IS_ADULT",
+                vec!["IS_ADULT"],
+                vec![
+                    Token::Identifier("age".into()),
+                    Token::CustomOp("IS_ADULT".into()),
+                ],
+                "non-reserved custom name tokenizes as custom op",
+            ),
+            (
+                "age NOT IS_ADULT",
+                vec!["IS_ADULT"],
+                vec![
+                    Token::Identifier("age".into()),
+                    Token::NotCustomOp("IS_ADULT".into()),
+                ],
+                "NOT followed by a custom op yields a negated custom op",
+            ),
+            (
+                "age NOT CONTAINS 1",
+                vec!["CONTAINS"],
+                vec![
+                    Token::Identifier("age".into()),
+                    Token::NotContains,
+                    Token::Number("1".into()),
+                ],
+                "built-in NOT combo still wins after NOT",
+            ),
+        ];
+        for (input, names, expected, desc) in cases {
+            let actual = lex_custom(input, &names).expect("should tokenize");
+            assert_eq!(actual, expected, "Failed: {}", desc);
+        }
+    }
+
+    #[test]
+    fn test_tokenize_structural_keywords_never_shadowed() {
+        let cases = vec![
+            // (input, custom names, expected token at index 0, description)
+            ("AND", vec!["AND"], Token::And, "AND is never a custom op"),
+            ("OR", vec!["OR"], Token::Or, "OR is never a custom op"),
+            (
+                "true",
+                vec!["true"],
+                Token::Boolean(true),
+                "true literal is never a custom op",
+            ),
+            (
+                "null",
+                vec!["null"],
+                Token::Null,
+                "null literal is never a custom op",
+            ),
+        ];
+        for (input, names, expected, desc) in cases {
+            let actual = lex_custom(input, &names).expect("should tokenize");
+            assert_eq!(actual.first(), Some(&expected), "Failed: {}", desc);
+        }
+    }
 
     // ==================== Success Cases ====================
 
@@ -601,7 +775,7 @@ mod tests {
         ];
 
         for case in cases {
-            let tokens = tokenize(case.input, None).unwrap_or_else(|e| {
+            let tokens = lex(case.input).unwrap_or_else(|e| {
                 panic!(
                     "Failed to tokenize '{}' ({}): {:?}",
                     case.name, case.input, e
@@ -628,7 +802,7 @@ mod tests {
         ];
 
         for (input, expected_op) in cases {
-            let tokens = tokenize(input, None).unwrap();
+            let tokens = lex(input).unwrap();
             assert_eq!(tokens[1], expected_op, "Failed for: {}", input);
         }
     }
@@ -645,7 +819,7 @@ mod tests {
         ];
 
         for (input, expected_op) in cases {
-            let tokens = tokenize(input, None).unwrap();
+            let tokens = lex(input).unwrap();
             assert_eq!(tokens[1], expected_op, "Failed for: {}", input);
         }
     }
@@ -659,7 +833,7 @@ mod tests {
         ];
 
         for (input, expected_op) in cases {
-            let tokens = tokenize(input, None).unwrap();
+            let tokens = lex(input).unwrap();
             assert_eq!(tokens[1], expected_op, "Failed for: {}", input);
         }
     }
@@ -667,12 +841,12 @@ mod tests {
     #[test]
     fn test_tokenize_case_sensitive() {
         // Operators are UPPERCASE, constants are lowercase
-        let tokens = tokenize("age > 18 AND premium == true", None).unwrap();
+        let tokens = lex("age > 18 AND premium == true").unwrap();
         assert_eq!(tokens[3], Token::And, "AND should be recognized");
         assert_eq!(tokens[6], Token::Boolean(true), "true should be recognized");
 
         // Lowercase 'and' should be treated as identifier
-        let tokens = tokenize("age > 18 and premium == true", None).unwrap();
+        let tokens = lex("age > 18 and premium == true").unwrap();
         assert_eq!(
             tokens[3],
             Token::Identifier("and".into()),
@@ -681,7 +855,7 @@ mod tests {
         assert_eq!(tokens[6], Token::Boolean(true), "true should still work");
 
         // Uppercase 'TRUE' should be treated as identifier (constants are lowercase)
-        let tokens = tokenize("age > 18 AND premium == TRUE", None).unwrap();
+        let tokens = lex("age > 18 AND premium == TRUE").unwrap();
         assert_eq!(tokens[3], Token::And, "AND should be recognized");
         assert_eq!(
             tokens[6],
@@ -690,7 +864,7 @@ mod tests {
         );
 
         // Mixed case operators should be treated as identifiers
-        let tokens = tokenize("age > 18 AnD premium == true", None).unwrap();
+        let tokens = lex("age > 18 AnD premium == true").unwrap();
         assert_eq!(
             tokens[3],
             Token::Identifier("AnD".into()),
@@ -752,7 +926,7 @@ mod tests {
         ];
 
         for case in cases {
-            let tokens = tokenize(case.input, None).unwrap();
+            let tokens = lex(case.input).unwrap();
             assert_eq!(
                 tokens, case.expected,
                 "Mismatch for '{}': {}",
@@ -789,7 +963,7 @@ mod tests {
         ];
 
         for case in cases {
-            let tokens = tokenize(case.input, None).unwrap();
+            let tokens = lex(case.input).unwrap();
             assert_eq!(
                 tokens, case.expected,
                 "Mismatch for '{}': {}",
@@ -807,7 +981,7 @@ mod tests {
         ];
 
         for (input, expected_op) in cases {
-            let tokens = tokenize(input, None).unwrap();
+            let tokens = lex(input).unwrap();
             assert_eq!(tokens[1], expected_op, "Failed for: {}", input);
         }
     }
@@ -871,7 +1045,7 @@ mod tests {
         ];
 
         for case in cases {
-            let tokens = tokenize(case.input, None).unwrap_or_else(|e| {
+            let tokens = lex(case.input).unwrap_or_else(|e| {
                 panic!(
                     "Failed to tokenize '{}' ({}): {:?}",
                     case.name, case.input, e
@@ -981,6 +1155,97 @@ mod tests {
                 name,
                 input
             );
+        }
+    }
+
+    #[test]
+    fn test_tokenize_exponents() {
+        // `[eE][+-]?[0-9]+` exponents lex to a single `Token::Number` carrying the
+        // literal text verbatim.
+        let cases = vec![
+            ("x == 1e5", "1e5"),
+            ("x == 1E5", "1E5"),
+            ("x == 1.5e3", "1.5e3"),
+            ("x == 2e-3", "2e-3"),
+            ("x == 2E+3", "2E+3"),
+            ("x == -1.5e10", "-1.5e10"),
+        ];
+
+        for (input, expected_literal) in cases {
+            let tokens =
+                lex(input).unwrap_or_else(|e| panic!("Expected '{}' to tokenize: {:?}", input, e));
+            let number = tokens
+                .iter()
+                .find_map(|t| match t {
+                    Token::Number(n) => Some(n.as_ref()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("No number token for '{}'", input));
+            assert_eq!(number, expected_literal, "Failed: {}", input);
+        }
+    }
+
+    #[test]
+    fn test_tokenize_number_format_errors() {
+        // Malformed numbers are rejected at lex time with a clear byte position.
+        // (input, expected byte position of the offending char)
+        let cases = vec![
+            ("leading plus", "x == +5", 5),
+            ("trailing dot", "x == 1.", 6),
+            ("digits into identifier", "x == 18abc", 7),
+            ("digits into underscore", "x == 5_000", 6),
+            ("exponent without digits", "x == 1e", 6),
+            ("exponent sign without digits", "x == 1e+", 6),
+        ];
+
+        for (name, input, expected_pos) in cases {
+            match tokenize(input, None) {
+                Err(DnfError::InvalidNumber { position, .. }) => {
+                    assert_eq!(position, expected_pos, "Wrong position for '{}'", name);
+                }
+                other => panic!("Expected InvalidNumber for '{}', got: {:?}", name, other),
+            }
+        }
+    }
+
+    #[test]
+    fn test_tokenize_spans() {
+        // Each token carries the exact `start..end` byte range it spans.
+        // (input, expected (token, span) pairs)
+        type SpanCase = (&'static str, Vec<(Token, std::ops::Range<usize>)>);
+        let cases: Vec<SpanCase> = vec![
+            (
+                "age > 18",
+                vec![
+                    (Token::Identifier("age".into()), 0..3),
+                    (Token::Gt, 4..5),
+                    (Token::Number("18".into()), 6..8),
+                ],
+            ),
+            (
+                r#"name == "US""#,
+                vec![
+                    (Token::Identifier("name".into()), 0..4),
+                    (Token::Eq, 5..7),
+                    (Token::String("US".into()), 8..12),
+                ],
+            ),
+            (
+                // `café` is 5 bytes (`é` is 2), so the identifier spans 0..5 and
+                // the operator starts at byte 6.
+                "café > 1",
+                vec![
+                    (Token::Identifier("café".into()), 0..5),
+                    (Token::Gt, 6..7),
+                    (Token::Number("1".into()), 8..9),
+                ],
+            ),
+        ];
+
+        for (input, expected) in cases {
+            let tokens = tokenize(input, None)
+                .unwrap_or_else(|e| panic!("Failed to tokenize '{}': {:?}", input, e));
+            assert_eq!(tokens, expected, "Span mismatch for: {}", input);
         }
     }
 }

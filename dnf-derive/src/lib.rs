@@ -510,14 +510,18 @@ fn nested_map_dispatch(map_expr: proc_macro2::TokenStream) -> proc_macro2::Token
             operator.any(#map_expr.keys(), value)
         } else if inner.starts_with("[\"") {
             if let Some(end_bracket) = inner.find("\"]") {
-                let key = &inner[2..end_bracket];
-                let rest = inner.get(end_bracket + 2..).unwrap_or("").trim_start_matches('.');
-                if rest.is_empty() {
+                if end_bracket < 3 {
                     false
                 } else {
-                    match #map_expr.get(key) {
-                        Some(item) => item.evaluate_field(rest, operator, value),
-                        None => false,
+                    let key = &inner[2..end_bracket];
+                    let rest = inner.get(end_bracket + 2..).unwrap_or("").trim_start_matches('.');
+                    if rest.is_empty() {
+                        false
+                    } else {
+                        match #map_expr.get(key) {
+                            Some(item) => item.evaluate_field(rest, operator, value),
+                            None => false,
+                        }
                     }
                 }
             } else {

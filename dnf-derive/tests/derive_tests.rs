@@ -1780,6 +1780,38 @@ fn test_nested_hashmap_specific_key_access() {
 }
 
 #[test]
+fn test_nested_hashmap_malformed_key_does_not_panic() {
+    let mut branches = HashMap::new();
+    branches.insert(
+        "hq".to_string(),
+        OfficeLocation {
+            city: "Boston".to_string(),
+            zip: "02101".to_string(),
+        },
+    );
+    let org = OrgWithBranches {
+        name: "Tech Inc".to_string(),
+        branches,
+    };
+
+    let cases = vec![
+        // (field path, description)
+        ("branches.[\"]", "lone quote-bracket (end_bracket == 1)"),
+        ("branches.[\"\"]", "empty key"),
+        ("branches.[\"\"].city", "empty key with tail"),
+        ("branches.[\"hq\"]", "key without tail"),
+        ("branches.[\"hq", "unterminated key"),
+    ];
+    for (field, desc) in cases {
+        assert!(
+            !test_field_condition(&org, field, Op::EQ, Value::from("Boston")),
+            "Failed: {}",
+            desc
+        );
+    }
+}
+
+#[test]
 fn test_nested_vec_with_query_builder() {
     let company = CompanyWithOffices {
         name: "Acme Corp".to_string(),

@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## 0.2.3 - 2026-10-05
+
+### Changed
+
+- Type checking is category-based (numeric / string / boolean); cross-type coercion is deferred to evaluation (`age > -5` on a `u32` field parses).
+- `BETWEEN` goes through the general array path: bounds are checked by element category, and a non-two-element range errors at parse time. Removed the `unreachable!()` arms.
+- Number grammar now accepts exponents: `-?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?`.
+- Recognize more string/`Option` forms: `Box<str>`, `Cow<str>`, `std::string::String`, `core::primitive::str`, `std::option::Option<T>`.
+- Custom operators take precedence over built-in keywords; `NOT <custom>` and value-less custom operators parse and round-trip.
+
+### Fixed
+
+- Scalar `IN` / `ANY OF` / `ALL OF` now perform real membership testing (previously always false).
+- `null` is no longer equal to `""`; `CONTAINS` / `STARTS WITH` / `ENDS WITH` return false for a `null` operand.
+- Ordering comparisons against a `NaN` field value return false.
+- A category mismatch (`count == "x"` on a numeric field) errors at parse time with `TypeMismatch`.
+- Malformed numbers (`+5`, `1.`, `18abc`, `5_000`, `1e`, `1e+`) error at lex time as `InvalidNumber` at the offending byte.
+- Parser errors carry accurate byte offsets for multi-byte input.
+
 ## [0.2.2] - 2026-07-20
 
 ### Added

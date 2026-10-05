@@ -17,6 +17,28 @@ fn format_location(position: usize, input: &str) -> String {
     )
 }
 
+/// Renders the location of a [`DnfError::TypeMismatch`] for Display.
+///
+/// When the source query is known (a parse-time error), the offending spot is
+/// reported SQL-style as ` near `…`` rather than a bare byte offset, which is
+/// easier to act on and robust to small position-bookkeeping slips. Falls back
+/// to ` at position N` (or nothing) when the query text is unavailable, as for
+/// evaluation-time mismatches.
+#[cfg(feature = "parser")]
+fn near_suffix(position: Option<usize>, input: Option<&str>) -> String {
+    match (position, input) {
+        (Some(pos), Some(src)) => format!(" near `{}`", get_context(src, pos)),
+        _ => position_suffix(position),
+    }
+}
+
+/// Without the `parser` feature there is no query text to quote, so the location
+/// degrades to ` at position N` (or nothing).
+#[cfg(not(feature = "parser"))]
+fn near_suffix(position: Option<usize>, _input: Option<&str>) -> String {
+    position_suffix(position)
+}
+
 /// Extracts a ~40-char snippet around `position` (with ellipses when
 /// truncated) for human-readable parser-error context.
 #[cfg(feature = "parser")]
@@ -73,10 +95,12 @@ pub enum DnfError {
     /// A value's type does not match what the field or operator expected.
     ///
     /// `position` is `Some` for parse-time errors (offset into the query
-    /// string) and `None` for evaluation-time errors.
+    /// string) and `None` for evaluation-time errors. When `input` is also
+    /// present the message points at the offending text SQL-style
+    /// (`… near `[1, "x"]``) instead of quoting the bare offset.
     #[error(
-        "Type mismatch for field '{field}'{}: expected {expected}, got {actual}",
-        position_suffix(*position)
+        "Type mismatch for field '{field}': expected {expected}, got {actual}{}",
+        near_suffix(*position, input.as_deref())
     )]
     TypeMismatch {
         /// The field whose value triggered the mismatch.
@@ -87,6 +111,9 @@ pub enum DnfError {
         actual: Box<str>,
         /// Byte offset into the source query, when known.
         position: Option<usize>,
+        /// The original query string, kept so the Display can quote a ` near `…``
+        /// snippet. `Some` for parse-time errors; `None` otherwise.
+        input: Option<Box<str>>,
     },
     /// The operator is not valid for the field's type.
     #[error("Invalid operator '{operator}' for field '{field}'")]

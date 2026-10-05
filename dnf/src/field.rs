@@ -211,6 +211,27 @@ impl_dnf_field_map!(HashMap, BTreeMap);
 mod tests {
     use super::*;
 
+    /// Verifies that `null` is never equal to the empty string, for both
+    /// `String` and `Option<String>` fields.
+    #[test]
+    fn test_null_is_not_empty_string() {
+        let empty = String::new();
+        assert!(!empty.evaluate(&Op::EQ, &Value::None));
+        assert!(empty.evaluate(&Op::NE, &Value::None));
+
+        let some_empty = Some(String::new());
+        assert!(!some_empty.evaluate(&Op::EQ, &Value::None));
+        assert!(some_empty.evaluate(&Op::NE, &Value::None));
+
+        let none: Option<String> = None;
+        assert!(none.evaluate(&Op::EQ, &Value::None));
+        assert!(!none.evaluate(&Op::NE, &Value::None));
+
+        assert!(some_empty.evaluate(&Op::EQ, &Value::from("")));
+        assert!("" != Value::None);
+        assert!(Value::None != "".into());
+    }
+
     /// Verifies `Option<T>` evaluation semantics: for `None`, only `EQ`
     /// and `NE` against null behave non-trivially (true and false
     /// respectively); every other operator returns false.

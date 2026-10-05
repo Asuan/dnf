@@ -45,6 +45,19 @@ pub struct Condition {
     field_name: Box<str>,
     operator: Op,
     value: Value,
+    /// Whether this is a value-less custom operator (e.g. `age IS_ADULT`).
+    ///
+    /// The authority is the [`OpRegistry`]'s `novalue` flag: the parser sets
+    /// this from the registered operator set, and [`crate::QueryBuilder::build`]
+    /// resolves it against the attached registry. [`Display`](fmt::Display) uses
+    /// it to omit the value operand so the output round-trips.
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "is_false"))]
+    novalue: bool,
+}
+
+#[cfg(feature = "serde")]
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl Condition {
@@ -57,7 +70,16 @@ impl Condition {
             field_name: field_name.into(),
             operator,
             value: value.into(),
+            novalue: false,
         }
+    }
+
+    #[cfg(feature = "parser")]
+    /// Marks this condition as value-less and returns it, for chaining after
+    /// [`new`](Self::new).
+    pub(crate) fn with_novalue(mut self, v: bool) -> Condition {
+        self.novalue = v;
+        self
     }
 
     /// Returns the field name this condition tests.
@@ -105,7 +127,13 @@ impl Condition {
 
 impl fmt::Display for Condition {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} {} {}", self.field_name, self.operator, self.value)
+        // Value-less custom ops carry no operand; emit just `field op` (no
+        // trailing `null`) so the output round-trips through the parser.
+        if self.novalue {
+            write!(f, "{} {}", self.field_name, self.operator)
+        } else {
+            write!(f, "{} {} {}", self.field_name, self.operator, self.value)
+        }
     }
 }
 
@@ -290,7 +318,17 @@ impl DnfQuery {
         }
     }
 
+    /// Attaches `registry` and resolves each custom condition's `novalue` flag
+    /// from it, so [`Display`](fmt::Display) renders value-less operators
+    /// without a trailing operand.
     pub(crate) fn set_custom_ops(mut self, registry: OpRegistry) -> Self {
+        for conjunction in &mut self.conjunctions {
+            for condition in &mut conjunction.conditions {
+                if let Some(name) = condition.operator.custom_name() {
+                    condition.novalue = registry.is_novalue(name);
+                }
+            }
+        }
         self.custom_ops = Some(registry);
         self
     }
@@ -1319,6 +1357,57 @@ mod tests {
         )
         .unwrap();
         assert_eq!(query, parsed);
+    }
+
+    #[test]
+    #[cfg(feature = "parser")]
+    fn test_display_roundtrip_novalue_custom_op() {
+        // A value-less custom op must display without a trailing `null` and
+        // re-parse to the same display, for both the plain and `NOT` forms.
+        // `novalue` is resolved from the builder's registry at build time, not
+        // inferred from the operand.
+        let cases = vec![
+            // (op, expected display, description)
+            (
+                Op::custom("IS_ADULT"),
+                "(age IS_ADULT)",
+                "plain value-less custom op omits the value",
+            ),
+            (
+                Op::not_custom("IS_ADULT"),
+                "(age NOT IS_ADULT)",
+                "negated value-less custom op omits the value",
+            ),
+        ];
+
+        let fields = vec![crate::FieldInfo::new("age", "u32")];
+        for (op, expected, desc) in cases {
+            let query = DnfQuery::builder()
+                .with_custom_op(
+                    "IS_ADULT",
+                    true,
+                    |field, _| matches!(field, Value::Uint(n) if *n >= 18),
+                )
+                .or(|c| c.and("age", op, Value::None))
+                .build();
+
+            let display_str = query.to_string();
+            assert_eq!(display_str, expected, "Failed display: {}", desc);
+
+            let parsed = crate::parser::parse_with_fields(
+                &display_str,
+                &fields,
+                Some(["IS_ADULT"].into_iter()),
+                Some(["IS_ADULT"].into_iter()),
+            )
+            .unwrap_or_else(|e| panic!("'{}' should re-parse ({}): {:?}", display_str, desc, e));
+            assert_eq!(
+                parsed.to_string(),
+                display_str,
+                "Failed roundtrip: {}",
+                desc
+            );
+        }
     }
 
     #[test]

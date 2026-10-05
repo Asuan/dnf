@@ -55,9 +55,9 @@ Or use the parser — it validates automatically:
 
 ```toml
 [dependencies]
-dnf = "0.2"                                       # derive only
-dnf = { version = "0.2", features = ["serde"] }   # + serialization
-dnf = { version = "0.2", features = ["parser"] }  # + string parsing
+dnf = "0.2.3"                                       # derive only
+dnf = { version = "0.2.3", features = ["serde"] }   # + serialization
+dnf = { version = "0.2.3", features = ["parser"] }  # + string parsing
 ```
 
 | Feature | What it does |
